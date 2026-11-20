@@ -4,6 +4,9 @@
 사용법:
     ./kkultong-dash run [--full] [--dry-run] [--env-file PATH] [--db PATH]
     ./kkultong-dash check-config [--env-file PATH]
+    ./kkultong-dash fact-init [--env-file PATH] [--db PATH]
+    ./kkultong-dash fact-revalidate [--dry-run] [--update-dashboard] [--host-delay SEC] [--env-file PATH] [--db PATH]
+    ./kkultong-dash fact-seed [--v1-page ID_OR_TITLE] [--v2-page ID_OR_TITLE] [--uploader NAME] [--dry-run] [--env-file PATH] [--db PATH]
 """
 
 from __future__ import annotations
@@ -17,16 +20,59 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from kkultong_dash import __version__
+from kkultong_dash import (
+    DEFAULT_SEED_V1_PAGE_TITLE,
+    DEFAULT_SEED_V2_PAGE_TITLE,
+    __version__,
+)
+from kkultong_dash.cache import LocalCache
 from kkultong_dash.config import AppConfig, load_dotenv
-from kkultong_dash.notion_client import NotionAPIError, ReadOnlyGuardError
-from kkultong_dash.runner import EXIT_FAILURE, run_dashboard_update
+from kkultong_dash.fact_ledger import ensure_fact_ledger_database, revalidate_fact_ledger
+from kkultong_dash.fact_seed import run_fact_seed
+from kkultong_dash.notion_client import NotionAPIError, NotionClient, ReadOnlyGuardError
+from kkultong_dash.runner import EXIT_FAILURE, EXIT_OK, run_dashboard_update
+
+
+def _build_client(cfg: AppConfig) -> NotionClient:
+    protected = [
+        cfg.experience_data_source_id,
+        cfg.competition_data_source_id,
+    ]
+    if cfg.parent_page_id:
+        protected.append(cfg.parent_page_id)
+    if cfg.settlement_page_id:
+        protected.append(cfg.settlement_page_id)
+    return NotionClient(
+        cfg.notion_token,
+        api_version=cfg.api_version,
+        base_url=cfg.api_base_url,
+        min_interval_sec=cfg.min_request_interval_sec,
+        timeout_sec=cfg.request_timeout_sec,
+        max_attempts=cfg.max_retry_attempts,
+        max_retry_after_sec=cfg.max_retry_after_sec,
+        protected_ids=protected,
+    )
+
+
+def _add_common_io_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="읽을 .env 파일 경로 (기본값: 현재 디렉터리 또는 저장소 루트의 .env)",
+    )
+    sub.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="로컬 SQLite 캐시 DB 경로 오버라이드",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kkultong-dash",
-        description="꿀통 대시보드 P1 (MVP) — 노션 DB를 읽어 현황 대시보드 페이지를 자동 갱신합니다.",
+        description="꿀통 대시보드 P1/P2 — 노션 대시보드 자동 갱신 및 팩트 장부 자동 재검증 도구입니다.",
     )
     parser.add_argument("--version", action="version", version=f"kkultong-dash {__version__}")
 
@@ -43,18 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="노션 DB를 읽어 집계 결과만 출력하고 대시보드 페이지에는 쓰지 않습니다.",
     )
-    run_cmd.add_argument(
-        "--env-file",
-        type=Path,
-        default=None,
-        help="읽을 .env 파일 경로 (기본값: 현재 디렉터리 또는 저장소 루트의 .env)",
-    )
-    run_cmd.add_argument(
-        "--db",
-        type=Path,
-        default=None,
-        help="로컬 SQLite 캐시 DB 경로 오버라이드",
-    )
+    _add_common_io_args(run_cmd)
 
     check_cmd = subparsers.add_parser(
         "check-config",
@@ -66,6 +101,60 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="점검할 .env 파일 경로",
     )
+
+    fact_init_cmd = subparsers.add_parser(
+        "fact-init",
+        help="'천하제일 꿀통대회' 아래에 '📒 팩트 장부' DB를 멱등하게 생성(이미 있으면 재사용)합니다.",
+    )
+    _add_common_io_args(fact_init_cmd)
+
+    fact_reval_cmd = subparsers.add_parser(
+        "fact-revalidate",
+        help="'📒 팩트 장부'의 확인됨/원문대조필요 행을 자동 재검증하고 충돌을 판정합니다.",
+    )
+    fact_reval_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="재검증 판정만 수행하고 노션 DB와 로컬 경보 저장은 생략합니다.",
+    )
+    fact_reval_cmd.add_argument(
+        "--update-dashboard",
+        action="store_true",
+        help="재검증 후 대시보드 페이지(섹션 A '팩트 경보' 포함)까지 즉시 갱신합니다.",
+    )
+    fact_reval_cmd.add_argument(
+        "--host-delay",
+        type=float,
+        default=None,
+        help="동일 사이트 요청 간 최소 대기 시간(초) 오버라이드 (기본값: 설정값 3.0초)",
+    )
+    _add_common_io_args(fact_reval_cmd)
+
+    fact_seed_cmd = subparsers.add_parser(
+        "fact-seed",
+        help="v1·v2 노션 페이지에서 플랫폼 수치를 추출해 '📒 팩트 장부'에 시드 입력합니다.",
+    )
+    fact_seed_cmd.add_argument(
+        "--v1-page",
+        default=DEFAULT_SEED_V1_PAGE_TITLE,
+        help=f"v1 원본 페이지 ID 또는 제목 (기본값: {DEFAULT_SEED_V1_PAGE_TITLE})",
+    )
+    fact_seed_cmd.add_argument(
+        "--v2-page",
+        default=DEFAULT_SEED_V2_PAGE_TITLE,
+        help=f"v2 원본 페이지 ID 또는 제목 (기본값: {DEFAULT_SEED_V2_PAGE_TITLE})",
+    )
+    fact_seed_cmd.add_argument(
+        "--uploader",
+        default="뮤즈",
+        help="'올린 이' 선택지 값 (기본값: 뮤즈)",
+    )
+    fact_seed_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="추출·변환 결과만 출력하고 노션 DB에는 쓰지 않습니다.",
+    )
+    _add_common_io_args(fact_seed_cmd)
 
     return parser
 
@@ -85,19 +174,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("상태: 대기 중 — NOTION_TOKEN 미설정", file=sys.stderr)
             return EXIT_FAILURE
         print("상태: 설정 확인 완료 (실제 API 권한 검증은 ./kkultong-dash run 실행 시 확인)")
-        return 0
+        return EXIT_OK
+
+    try:
+        cfg = AppConfig.from_env(
+            repo_root=REPO_ROOT,
+            db_path_override=getattr(args, "db", None),
+            require_token=True,
+        )
+    except ValueError as exc:
+        print(f"[설정 오류] {exc}", file=sys.stderr)
+        return EXIT_FAILURE
 
     if args.command == "run":
-        try:
-            cfg = AppConfig.from_env(
-                repo_root=REPO_ROOT,
-                db_path_override=args.db,
-                require_token=True,
-            )
-        except ValueError as exc:
-            print(f"[설정 오류] {exc}", file=sys.stderr)
-            return EXIT_FAILURE
-
         try:
             outcome = run_dashboard_update(
                 cfg,
@@ -121,6 +210,93 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args.dry_run:
             print("[dry-run] 노션 페이지 쓰기를 생략했습니다.")
         return outcome.exit_code
+
+    if args.command == "fact-init":
+        client = _build_client(cfg)
+        try:
+            with LocalCache(cfg.db_path) as cache:
+                res = ensure_fact_ledger_database(
+                    client,
+                    cache,
+                    parent_page_id=cfg.parent_page_id,
+                    configured_database_id=cfg.fact_ledger_database_id,
+                    configured_data_source_id=cfg.fact_ledger_data_source_id,
+                    parent_page_title=cfg.parent_page_title,
+                    db_title=cfg.fact_ledger_db_title,
+                    create_if_missing=True,
+                )
+        except (NotionAPIError, ReadOnlyGuardError) as exc:
+            print(f"[팩트 장부 초기화 실패] {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+
+        action = "신규 생성" if res.created else "기존 DB 확인(재생성 안 함)"
+        print(
+            f"[팩트 장부 초기화 완료 — {action}] title={res.db_title} | "
+            f"database_id={res.database_id} | data_source_id={res.data_source_id} | "
+            f"자기참조 relation 반영={res.relations_patched}"
+        )
+        return EXIT_OK
+
+    if args.command == "fact-revalidate":
+        client = _build_client(cfg)
+        host_delay = (
+            cfg.fact_revalidate_host_delay_sec
+            if args.host_delay is None
+            else max(0.0, float(args.host_delay))
+        )
+        try:
+            with LocalCache(cfg.db_path) as cache:
+                reval = revalidate_fact_ledger(
+                    client,
+                    cache,
+                    parent_page_id=cfg.parent_page_id,
+                    configured_database_id=cfg.fact_ledger_database_id,
+                    configured_data_source_id=cfg.fact_ledger_data_source_id,
+                    parent_page_title=cfg.parent_page_title,
+                    db_title=cfg.fact_ledger_db_title,
+                    host_delay_sec=host_delay,
+                    dry_run=args.dry_run,
+                )
+                print(reval.summary_text)
+                if args.update_dashboard and not args.dry_run:
+                    dash_outcome = run_dashboard_update(
+                        cfg,
+                        client=client,
+                        cache=cache,
+                    )
+                    print(dash_outcome.summary_text)
+                    return dash_outcome.exit_code
+        except (NotionAPIError, ReadOnlyGuardError) as exc:
+            print(f"[팩트 재검증 실패] {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+        return EXIT_OK
+
+    if args.command == "fact-seed":
+        client = _build_client(cfg)
+        try:
+            with LocalCache(cfg.db_path) as cache:
+                seed_out = run_fact_seed(
+                    client,
+                    cache,
+                    v1_identifier=args.v1_page,
+                    v2_identifier=args.v2_page,
+                    uploader=args.uploader,
+                    parent_page_id=cfg.parent_page_id,
+                    configured_database_id=cfg.fact_ledger_database_id,
+                    configured_data_source_id=cfg.fact_ledger_data_source_id,
+                    parent_page_title=cfg.parent_page_title,
+                    db_title=cfg.fact_ledger_db_title,
+                    dry_run=args.dry_run,
+                )
+        except (NotionAPIError, ReadOnlyGuardError) as exc:
+            print(f"[팩트 시드 입력 실패] {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+
+        if not seed_out.ok:
+            print(seed_out.summary_text, file=sys.stderr)
+            return EXIT_FAILURE
+        print(seed_out.summary_text)
+        return EXIT_OK
 
     return EXIT_FAILURE
 

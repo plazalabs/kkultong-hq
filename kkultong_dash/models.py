@@ -181,6 +181,72 @@ class CompetitionAnalytics:
     total_verify_stats: OwnerVerifyStats
 
 
+@dataclass(frozen=True)
+class FactAlert:
+    """대시보드 섹션 A '팩트 경보' 항목."""
+
+    page_id: str
+    claim: str
+    topic_key: str
+    reason: str
+    url: Optional[str] = None
+    old_grade: Optional[str] = None
+    new_grade: Optional[str] = None
+    detected_at_kst: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SettlementSummary:
+    """대시보드 섹션 G 정산판 조회 결과."""
+
+    page_id: Optional[str]
+    title: str
+    url: str
+    accessible: bool
+    structured: bool
+    structure_type: str  # "database" | "table" | "unstructured" | "error" | "unconfigured"
+    summary_lines: list[str] = field(default_factory=list)
+    table_headers: list[str] = field(default_factory=list)
+    table_rows: list[list[str]] = field(default_factory=list)
+    error_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FactLedgerRow:
+    """'📒 팩트 장부' DB의 정규화된 1행."""
+
+    page_id: str
+    claim: str  # 주장 (title)
+    topic_key: str  # 주제키 (text)
+    value: str  # 값 (text)
+    source_url: Optional[str]  # 근거 URL (url)
+    excerpt: str  # 원문 발췌 (text)
+    verified_at: Optional[datetime] = None  # 확인 시각 (date, with time)
+    verifier: Optional[str] = None  # 확인자 (select)
+    grade: Optional[str] = None  # 등급 (select)
+    auto_revalidated_at: Optional[datetime] = None  # 자동 재검증 시각 (date)
+    auto_revalidation_result: Optional[str] = None  # 자동 재검증 결과 (select)
+    conflict_ids: tuple[str, ...] = ()  # 충돌 (relation, self-DB)
+    superseded_ids: tuple[str, ...] = ()  # 대체됨 (relation, self-DB)
+    uploader: Optional[str] = None  # 올린 이 (select)
+    corrector: Optional[str] = None  # 정정한 이 (select)
+
+
+@dataclass(frozen=True)
+class FactSeedCandidate:
+    """시드 입력용으로 추출된 플랫폼 수치 후보 1건."""
+
+    platform: str
+    claim: str
+    topic_key: str
+    value: str
+    source_url: Optional[str]
+    grade: str  # 근거 URL 없음 -> '미확인', v2 근거 URL 있음 -> '원문대조필요' (절대 '확인됨' 불가)
+    excerpt: str = ""
+    uploader: Optional[str] = None
+    source_page_label: str = ""
+
+
 @dataclass
 class DashboardReport:
     """대시보드 전체 렌더링 입력 모델."""
@@ -193,3 +259,5 @@ class DashboardReport:
     competition_sync: SourceSyncResult
     experience_analytics: Optional[ExperienceAnalytics]
     competition_analytics: Optional[CompetitionAnalytics]
+    fact_alerts: list[FactAlert] = field(default_factory=list)
+    settlement_summary: Optional[SettlementSummary] = None

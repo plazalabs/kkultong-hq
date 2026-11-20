@@ -29,7 +29,12 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
-from . import DASHBOARD_PAGE_TITLE, NOTION_API_BASE_URL, NOTION_API_VERSION
+from . import (
+    DASHBOARD_PAGE_TITLE,
+    FACT_LEDGER_DB_TITLE,
+    NOTION_API_BASE_URL,
+    NOTION_API_VERSION,
+)
 
 
 class NotionAPIError(RuntimeError):
@@ -93,7 +98,7 @@ def _default_transport(
 
 
 class NotionClient:
-    """읽기 전용 원본 + 대시보드 페이지 한정 쓰기를 강제하는 Notion API 클라이언트."""
+    """읽기 전용 원본 + 대시보드 페이지 및 팩트 장부 DB 한정 쓰기를 강제하는 Notion API 클라이언트."""
 
     def __init__(
         self,
@@ -121,6 +126,7 @@ class NotionClient:
         self.max_attempts = max(1, int(max_attempts))
         self.max_retry_after_sec = max(1.0, float(max_retry_after_sec))
         self._protected_ids = {self._canonical_id(i) for i in protected_ids if i}
+        self._allowed_fact_ledger_ds_ids: set[str] = set()
         self._transport = transport or _default_transport
         self._sleep = sleep_fn
         self._monotonic = monotonic_fn
@@ -134,13 +140,41 @@ class NotionClient:
     def register_protected_id(self, notion_id: str) -> None:
         """절대 수정/삭제해서는 안 되는 페이지/데이터 소스 ID를 보호 목록에 등록한다."""
         if notion_id:
-            self._protected_ids.add(self._canonical_id(notion_id))
+            cid = self._canonical_id(notion_id)
+            self._protected_ids.add(cid)
+            self._allowed_fact_ledger_ds_ids.discard(cid)
+
+    def register_fact_ledger_data_source(self, data_source_id: str) -> None:
+        """검증된 '📒 팩트 장부' 데이터 소스 ID만 쓰기 허용 목록에 등록한다."""
+        if not data_source_id:
+            return
+        self._assert_not_protected(data_source_id, "register_fact_ledger_data_source")
+        self._allowed_fact_ledger_ds_ids.add(self._canonical_id(data_source_id))
 
     def _assert_not_protected(self, target_id: str, operation: str) -> None:
         if self._canonical_id(target_id) in self._protected_ids:
             raise ReadOnlyGuardError(
                 f"읽기 전용 보호 위반 차단: {operation} 대상({target_id})은 보호된 기존 리소스입니다."
             )
+
+    def _assert_allowed_fact_ledger_ds(self, data_source_id: str, operation: str) -> None:
+        self._assert_not_protected(data_source_id, operation)
+        if self._canonical_id(data_source_id) not in self._allowed_fact_ledger_ds_ids:
+            raise ReadOnlyGuardError(
+                f"쓰기 허용 대상 위반 차단: {operation} 대상({data_source_id})은 "
+                f"검증된 '{FACT_LEDGER_DB_TITLE}' 데이터 소스로 등록되지 않았습니다."
+            )
+
+    @staticmethod
+    def _assert_no_confirmed_grade_write(properties: dict[str, Any], operation: str) -> None:
+        """절대 규칙: 앱은 등급을 '확인됨'으로 올리거나 자동 설정하지 않는다."""
+        grade_prop = properties.get("등급")
+        if isinstance(grade_prop, dict):
+            sel = grade_prop.get("select")
+            if isinstance(sel, dict) and str(sel.get("name") or "").strip() == "확인됨":
+                raise ReadOnlyGuardError(
+                    f"등급 상향 금지 위반 차단({operation}): 앱은 등급을 '확인됨'으로 설정할 수 없습니다."
+                )
 
     def _pace(self) -> None:
         if self.min_interval_sec <= 0.0:
@@ -419,6 +453,47 @@ class NotionClient:
         """GET /v1/pages/{page_id} 로 페이지 메타데이터를 조회한다."""
         return self._request("GET", f"/pages/{page_id}", idempotent=True)
 
+    def retrieve_database(self, database_id: str) -> dict[str, Any]:
+        """GET /v1/databases/{database_id} 로 데이터베이스 메타데이터(하위 data_sources 포함)를 조회한다."""
+        return self._request("GET", f"/databases/{database_id}", idempotent=True)
+
+    def retrieve_data_source(self, data_source_id: str) -> dict[str, Any]:
+        """GET /v1/data_sources/{data_source_id} 로 데이터 소스 스키마를 조회한다."""
+        return self._request("GET", f"/data_sources/{data_source_id}", idempotent=True)
+
+    def search_data_sources(self, query: str) -> list[dict[str, Any]]:
+        """POST /v1/search 로 제목 기준 데이터 소스를 검색한다 (API 2025-09-03+ data_source 필터)."""
+        sources: list[dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+
+        while True:
+            payload: dict[str, Any] = {
+                "query": query,
+                "filter": {"property": "object", "value": "data_source"},
+                "page_size": 100,
+            }
+            if next_cursor is not None:
+                payload["start_cursor"] = next_cursor
+
+            data = self._request("POST", "/search", json_body=payload, idempotent=True)
+            results = data.get("results")
+            if not isinstance(results, list):
+                raise NotionEmptyResponseError("검색 응답에 results 배열이 없습니다.", code="missing_results")
+
+            for item in results:
+                if isinstance(item, dict) and item.get("object") == "data_source":
+                    sources.append(item)
+
+            if not data.get("has_more"):
+                break
+            next_cursor = data.get("next_cursor")
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+
+        return sources
+
     def list_block_children(self, block_id: str, *, page_size: int = 100) -> list[dict[str, Any]]:
         """GET /v1/blocks/{block_id}/children 으로 1단계 하위 블록을 모두 조회한다."""
         blocks: list[dict[str, Any]] = []
@@ -518,3 +593,71 @@ class NotionClient:
         """DELETE /v1/blocks/{block_id} 로 대시보드 내부 자동 갱신 블록을 휴지통으로 보낸다."""
         self._assert_not_protected(block_id, "delete_block")
         return self._request("DELETE", f"/blocks/{block_id}", idempotent=True)
+
+    # ------------------------------------------------------------------
+    # P2 팩트 장부 DB 전용 쓰기 메서드 (보호된 기존 DB/페이지 쓰기 및 '확인됨' 상향 원천 차단)
+    # ------------------------------------------------------------------
+
+    def create_fact_ledger_database(
+        self,
+        parent_page_id: str,
+        initial_properties: dict[str, Any],
+        *,
+        title: str = FACT_LEDGER_DB_TITLE,
+    ) -> dict[str, Any]:
+        """'천하제일 꿀통대회' 아래에 '📒 팩트 장부' DB를 생성한다 (API 2026-03-11 initial_data_source)."""
+        if title != FACT_LEDGER_DB_TITLE:
+            raise ReadOnlyGuardError(
+                f"허용되지 않은 DB 생성 제목입니다: {title!r} (허용: {FACT_LEDGER_DB_TITLE!r})"
+            )
+        payload = {
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "initial_data_source": {
+                "properties": initial_properties,
+            },
+        }
+        return self._request("POST", "/databases", json_body=payload, idempotent=False)
+
+    def update_fact_ledger_schema(
+        self,
+        data_source_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, Any]:
+        """검증된 팩트 장부 데이터 소스의 스키마(자기참조 relation 등)를 갱신한다."""
+        self._assert_allowed_fact_ledger_ds(data_source_id, "update_fact_ledger_schema")
+        payload = {"properties": properties}
+        return self._request(
+            "PATCH",
+            f"/data_sources/{data_source_id}",
+            json_body=payload,
+            idempotent=False,
+        )
+
+    def create_fact_ledger_page(
+        self,
+        data_source_id: str,
+        properties: dict[str, Any],
+    ) -> dict[str, Any]:
+        """검증된 '📒 팩트 장부' 데이터 소스에 새 행(페이지)을 추가한다 (등급 '확인됨' 자동 설정 금지)."""
+        self._assert_allowed_fact_ledger_ds(data_source_id, "create_fact_ledger_page")
+        self._assert_no_confirmed_grade_write(properties, "create_fact_ledger_page")
+        payload = {
+            "parent": {"type": "data_source_id", "data_source_id": data_source_id},
+            "properties": properties,
+        }
+        return self._request("POST", "/pages", json_body=payload, idempotent=False)
+
+    def update_fact_ledger_page(
+        self,
+        page_id: str,
+        properties: dict[str, Any],
+        *,
+        data_source_id: str,
+    ) -> dict[str, Any]:
+        """검증된 '📒 팩트 장부' 소속 행의 속성을 갱신한다 (등급 '확인됨' 상향 금지)."""
+        self._assert_not_protected(page_id, "update_fact_ledger_page")
+        self._assert_allowed_fact_ledger_ds(data_source_id, "update_fact_ledger_page")
+        self._assert_no_confirmed_grade_write(properties, "update_fact_ledger_page")
+        payload = {"properties": properties}
+        return self._request("PATCH", f"/pages/{page_id}", json_body=payload, idempotent=False)

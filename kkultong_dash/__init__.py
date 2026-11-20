@@ -1,10 +1,10 @@
-"""kkultong-dash P1 (MVP): 꿀통 대시보드 자동 갱신 패키지."""
+"""kkultong-dash P1/P2: 꿀통 대시보드 자동 갱신 및 팩트 장부 패키지."""
 
 from __future__ import annotations
 
 from datetime import timedelta, timezone
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # 공식 문서 확인(2026-11-20):
 # - Versioning: https://developers.notion.com/reference/versioning
@@ -21,6 +21,14 @@ DEFAULT_COMPETITION_DATA_SOURCE_ID = "41b89944-f230-814b-a322-000bfaf7e533"
 
 PARENT_PAGE_TITLE = "천하제일 꿀통대회"
 DASHBOARD_PAGE_TITLE = "📊 꿀통 대시보드 (자동 갱신)"
+
+# 섹션 G 정산판 기본값 (피클 06:22 답변 기준)
+DEFAULT_SETTLEMENT_PAGE_ID = "41a89944-f230-817a-9849-d34d51978411"
+DEFAULT_SETTLEMENT_PAGE_TITLE = "📊 일별·월별 수익 통계 & 실행 체크리스트"
+DEFAULT_SETTLEMENT_PAGE_URL = "https://app.notion.com/p/41a89944f230817a9849d34d51978411"
+
+# 정기 갱신 시각 (KST 시, 분)
+REGULAR_UPDATE_TIMES_KST = ((11, 20), (17, 50))
 
 # 섹션 E 수동 입력 보존 구간 마커
 MANUAL_E_START_MARKER = "[KKULTONG-MANUAL-E:START]"
@@ -54,3 +62,26 @@ COMPETITION_CATEGORIES = (
     "인스팅트 완료",
 )
 COMPETITION_VERIFY_GRADES = ("확인됨", "원문대조필요", "미확인", "해당없음")
+
+# P2 팩트 장부 DB 스키마 상수
+FACT_LEDGER_DB_TITLE = "📒 팩트 장부"
+FACT_LEDGER_ACTORS = ("뮤즈", "피클", "큐", "인스팅트", "클실장", "회장님")
+FACT_LEDGER_GRADES = ("확인됨", "원문대조필요", "미확인", "불일치", "자동확인불가")
+FACT_LEDGER_REVALIDATION_RESULTS = (
+    "발췌 그대로",
+    "발췌 사라짐",
+    "페이지 열림 실패",
+    "로그인 필요",
+)
+FACT_LEDGER_REVALIDATE_TARGET_GRADES = frozenset({"확인됨", "원문대조필요"})
+
+# P2 초기 시드 입력 대상 페이지 제목 기본값
+DEFAULT_SEED_V1_PAGE_TITLE = "C 갈래 영어 시범 — 작업 분할 v1"
+DEFAULT_SEED_V2_PAGE_TITLE = "원소스 멀티유즈 워크플로우 v2"
+SEED_TARGET_PLATFORMS = (
+    "Gumroad",
+    "Patreon",
+    "Medium",
+    "네이버 프리미엄콘텐츠",
+    "Substack",
+)

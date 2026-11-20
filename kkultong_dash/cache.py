@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import KST
-from .models import SourceSyncResult
+from .models import FactAlert, SourceSyncResult
 from .notion_client import NotionAPIError, NotionClient
 from .parsers import parse_iso_datetime
 
@@ -98,6 +98,25 @@ class LocalCache:
                     dashboard_page_id TEXT NOT NULL,
                     blocks_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS fact_revalidation_skip_list (
+                    url TEXT PRIMARY KEY,
+                    page_id TEXT,
+                    reason TEXT NOT NULL,
+                    added_at_kst TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS fact_alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    page_id TEXT NOT NULL,
+                    claim TEXT NOT NULL,
+                    topic_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    url TEXT,
+                    old_grade TEXT,
+                    new_grade TEXT,
+                    detected_at_kst TEXT NOT NULL
+                );
                 """
             )
 
@@ -154,6 +173,111 @@ class LocalCache:
                     json.dumps(blocks, ensure_ascii=False),
                 ),
             )
+
+    # ------------------------------------------------------------------
+    # P2 팩트 장부 재검증 제외 목록(로그인 필요) 및 팩트 경보 저장
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_skip_url(url: str) -> str:
+        return url.strip()
+
+    def is_url_in_skip_list(self, url: Optional[str]) -> bool:
+        """로그인 필요 등으로 재시도 금지 목록에 등록된 URL인지 확인한다."""
+        if not url or not url.strip():
+            return False
+        norm = self._normalize_skip_url(url)
+        row = self._conn.execute(
+            "SELECT 1 FROM fact_revalidation_skip_list WHERE url = ?",
+            (norm,),
+        ).fetchone()
+        return row is not None
+
+    def add_url_to_skip_list(
+        self,
+        url: str,
+        *,
+        page_id: Optional[str] = None,
+        reason: str = "로그인 필요",
+        added_at_kst: Optional[datetime] = None,
+    ) -> None:
+        """로그인 필요 URL을 재시도 금지 목록에 영구 기록한다 (우회/재시도 금지)."""
+        norm = self._normalize_skip_url(url)
+        if not norm:
+            return
+        ts = (added_at_kst or datetime.now(KST)).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO fact_revalidation_skip_list (url, page_id, reason, added_at_kst)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    page_id = COALESCE(excluded.page_id, fact_revalidation_skip_list.page_id),
+                    reason = excluded.reason,
+                    added_at_kst = excluded.added_at_kst
+                """,
+                (norm, page_id, reason, ts),
+            )
+
+    def list_skip_urls(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT url, page_id, reason, added_at_kst FROM fact_revalidation_skip_list ORDER BY url ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def replace_fact_alerts(
+        self,
+        alerts: list[FactAlert],
+        *,
+        checked_at_kst: Optional[datetime] = None,
+    ) -> None:
+        """최신 팩트 재검증 경보 목록을 저장한다 (대시보드 섹션 A '팩트 경보' 표시용)."""
+        ts_default = (checked_at_kst or datetime.now(KST)).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        with self._conn:
+            self._conn.execute("DELETE FROM fact_alerts")
+            self._conn.executemany(
+                """
+                INSERT INTO fact_alerts (
+                    page_id, claim, topic_key, reason, url, old_grade, new_grade, detected_at_kst
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        a.page_id,
+                        a.claim,
+                        a.topic_key,
+                        a.reason,
+                        a.url,
+                        a.old_grade,
+                        a.new_grade,
+                        a.detected_at_kst or ts_default,
+                    )
+                    for a in alerts
+                ],
+            )
+
+    def load_fact_alerts(self) -> list[FactAlert]:
+        """저장된 '팩트 경보' 항목 목록을 불러온다."""
+        rows = self._conn.execute(
+            """
+            SELECT page_id, claim, topic_key, reason, url, old_grade, new_grade, detected_at_kst
+            FROM fact_alerts
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [
+            FactAlert(
+                page_id=str(r["page_id"]),
+                claim=str(r["claim"]),
+                topic_key=str(r["topic_key"]),
+                reason=str(r["reason"]),
+                url=r["url"],
+                old_grade=r["old_grade"],
+                new_grade=r["new_grade"],
+                detected_at_kst=r["detected_at_kst"],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # 데이터 소스 캐시 조회/갱신

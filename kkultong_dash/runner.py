@@ -15,6 +15,7 @@ from .notion_client import NotionClient
 from .parsers import parse_competition_row, parse_experience_row
 from .publisher import DashboardPublisher, PublishResult
 from .renderer import format_cli_summary
+from .settlement import inspect_settlement_page
 
 # 종료 코드 규칙:
 # 0 = 정상, 2 = 부분 실패 (섹션 A에 원인 기록 완료), 1 = 전체 실패
@@ -43,6 +44,15 @@ def run_dashboard_update(
     """두 노션 DB를 동기화하고 대시보드 페이지를 갱신한다."""
     current_kst = (now_kst or datetime.now(KST)).astimezone(KST)
 
+    protected = [
+        config.experience_data_source_id,
+        config.competition_data_source_id,
+    ]
+    if config.parent_page_id:
+        protected.append(config.parent_page_id)
+    if config.settlement_page_id:
+        protected.append(config.settlement_page_id)
+
     notion_client = client or NotionClient(
         config.notion_token,
         api_version=config.api_version,
@@ -51,16 +61,10 @@ def run_dashboard_update(
         timeout_sec=config.request_timeout_sec,
         max_attempts=config.max_retry_attempts,
         max_retry_after_sec=config.max_retry_after_sec,
-        protected_ids=[
-            config.experience_data_source_id,
-            config.competition_data_source_id,
-            *( [config.parent_page_id] if config.parent_page_id else [] ),
-        ],
+        protected_ids=protected,
     )
-    notion_client.register_protected_id(config.experience_data_source_id)
-    notion_client.register_protected_id(config.competition_data_source_id)
-    if config.parent_page_id:
-        notion_client.register_protected_id(config.parent_page_id)
+    for pid in protected:
+        notion_client.register_protected_id(pid)
 
     owns_cache = cache is None
     local_cache = cache or LocalCache(config.db_path)
@@ -101,6 +105,11 @@ def run_dashboard_update(
             else None
         )
 
+        # 섹션 G 정산판 읽기 전용 점검 (접근 불가/비구조화 시에도 대시보드 갱신 실패로 처리하지 않고 수동 확인 유지)
+        settlement_summary = inspect_settlement_page(notion_client, config.settlement_page_id)
+        # 섹션 A 팩트 경보 로드 (P2 자동 재검증에서 기록된 경보)
+        fact_alerts = local_cache.load_fact_alerts()
+
         failure_reasons: list[str] = []
         if not exp_sync.ok and exp_sync.error_message:
             failure_reasons.append(exp_sync.error_message)
@@ -128,6 +137,8 @@ def run_dashboard_update(
             competition_sync=comp_sync,
             experience_analytics=exp_analytics,
             competition_analytics=comp_analytics,
+            fact_alerts=fact_alerts,
+            settlement_summary=settlement_summary,
         )
 
         publish_result: Optional[PublishResult] = None
@@ -161,6 +172,8 @@ def run_dashboard_update(
                     "fetched_count": comp_sync.fetched_count,
                     "error": comp_sync.error_message,
                 },
+                "fact_alerts_count": len(fact_alerts),
+                "settlement_structure": settlement_summary.structure_type,
                 "warnings": report.warnings,
                 "dashboard_page_id": publish_result.dashboard_page_id if publish_result else None,
             },

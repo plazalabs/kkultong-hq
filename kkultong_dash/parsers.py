@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from . import KST
-from .models import CompetitionRow, ExperienceRow
+from .models import CompetitionRow, ExperienceRow, FactLedgerRow
 
 
 def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -55,6 +55,26 @@ def parse_notion_date(prop: Optional[dict[str, Any]]) -> Optional[date]:
     return dt.astimezone(KST).date()
 
 
+def parse_notion_datetime(prop: Optional[dict[str, Any]]) -> Optional[datetime]:
+    """Notion date 속성에서 timezone-aware datetime을 추출한다 (시각 미포함 시 KST 00:00)."""
+    if not isinstance(prop, dict):
+        return None
+    date_obj = prop.get("date")
+    if not isinstance(date_obj, dict):
+        return None
+    start = date_obj.get("start")
+    if not isinstance(start, str) or not start.strip():
+        return None
+    raw = start.strip()
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        try:
+            d = date.fromisoformat(raw)
+            return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=KST)
+        except ValueError:
+            return None
+    return parse_iso_datetime(raw)
+
+
 def extract_rich_text_plain(items: Any) -> str:
     """rich_text 또는 title 배열에서 평문 문자열을 원문 그대로 이어 붙인다."""
     if not isinstance(items, list):
@@ -71,6 +91,28 @@ def extract_rich_text_plain(items: Any) -> str:
         if isinstance(text_obj, dict) and isinstance(text_obj.get("content"), str):
             chunks.append(text_obj["content"])
     return "".join(chunks)
+
+
+def extract_rich_text_links(items: Any) -> list[str]:
+    """rich_text 또는 title 배열에서 하이퍼링크 URL 목록을 추출한다."""
+    if not isinstance(items, list):
+        return []
+    urls: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        href = item.get("href")
+        if isinstance(href, str) and href.strip():
+            urls.append(href.strip())
+            continue
+        text_obj = item.get("text")
+        if isinstance(text_obj, dict):
+            link = text_obj.get("link")
+            if isinstance(link, dict):
+                url = link.get("url")
+                if isinstance(url, str) and url.strip():
+                    urls.append(url.strip())
+    return urls
 
 
 def extract_title_property(properties: dict[str, Any], prop_name: str) -> str:
@@ -124,12 +166,38 @@ def extract_url_property(properties: dict[str, Any], prop_name: str) -> Optional
     return None
 
 
+def extract_relation_ids(properties: dict[str, Any], prop_name: str) -> tuple[str, ...]:
+    """relation 속성에서 연결된 페이지 ID 튜플을 추출한다."""
+    prop = properties.get(prop_name)
+    if not isinstance(prop, dict):
+        return ()
+    rel_list = prop.get("relation")
+    if not isinstance(rel_list, list):
+        return ()
+    ids: list[str] = []
+    for item in rel_list:
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
+            ids.append(item["id"].strip())
+    return tuple(ids)
+
+
 def extract_page_title(page: dict[str, Any]) -> str:
     """일반 Notion 페이지 객체에서 title 평문을 추출한다."""
     properties = page.get("properties")
     if not isinstance(properties, dict):
         return ""
     return extract_title_property(properties, "title")
+
+
+def extract_database_title(db_or_ds: dict[str, Any]) -> str:
+    """Notion database 또는 data_source 객체에서 title 평문을 추출한다."""
+    title_arr = db_or_ds.get("title")
+    if isinstance(title_arr, list):
+        return extract_rich_text_plain(title_arr).strip()
+    name = db_or_ds.get("name")
+    if isinstance(name, str):
+        return name.strip()
+    return ""
 
 
 def extract_block_plain_text(block: dict[str, Any]) -> str:
@@ -140,9 +208,14 @@ def extract_block_plain_text(block: dict[str, Any]) -> str:
     body = block.get(block_type)
     if not isinstance(body, dict):
         return ""
-    if block_type == "child_page":
+    if block_type in {"child_page", "child_database"}:
         title = body.get("title")
         return title if isinstance(title, str) else ""
+    if block_type == "table_row":
+        cells = body.get("cells")
+        if isinstance(cells, list):
+            return " | ".join(extract_rich_text_plain(cell).strip() for cell in cells)
+        return ""
     if "rich_text" in body:
         return extract_rich_text_plain(body.get("rich_text"))
     return ""
@@ -196,4 +269,26 @@ def parse_competition_row(page: dict[str, Any]) -> CompetitionRow:
         chairman_verdict=extract_text_property(props, "회장님 판정").strip(),
         created_time=parse_iso_datetime(page.get("created_time")),
         last_edited_time=parse_iso_datetime(page.get("last_edited_time")),
+    )
+
+
+def parse_fact_ledger_row(page: dict[str, Any]) -> FactLedgerRow:
+    """'📒 팩트 장부' DB 페이지 1건을 FactLedgerRow로 변환한다."""
+    props = page.get("properties") if isinstance(page.get("properties"), dict) else {}
+    return FactLedgerRow(
+        page_id=str(page.get("id") or ""),
+        claim=extract_title_property(props, "주장"),
+        topic_key=extract_text_property(props, "주제키").strip(),
+        value=extract_text_property(props, "값").strip(),
+        source_url=extract_url_property(props, "근거 URL"),
+        excerpt=extract_text_property(props, "원문 발췌"),
+        verified_at=parse_notion_datetime(props.get("확인 시각")),
+        verifier=extract_select_property(props, "확인자"),
+        grade=extract_select_property(props, "등급"),
+        auto_revalidated_at=parse_notion_datetime(props.get("자동 재검증 시각")),
+        auto_revalidation_result=extract_select_property(props, "자동 재검증 결과"),
+        conflict_ids=extract_relation_ids(props, "충돌"),
+        superseded_ids=extract_relation_ids(props, "대체됨"),
+        uploader=extract_select_property(props, "올린 이"),
+        corrector=extract_select_property(props, "정정한 이"),
     )

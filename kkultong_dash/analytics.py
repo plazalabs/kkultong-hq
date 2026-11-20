@@ -13,6 +13,7 @@ from . import (
     EXPERIENCE_STATUS_ORDER,
     EXPERIENCE_WON_STATUSES,
     KST,
+    REGULAR_UPDATE_TIMES_KST,
 )
 from .models import (
     CompetitionAnalytics,
@@ -32,9 +33,32 @@ SELF_PURCHASE_CAMPAIGN_PREFIX = "쿠팡 리뷰:"
 SELF_PURCHASE_REWARD_KEYWORD = "본인 구매"
 SELF_PURCHASE_RULE_TEXT = (
     "분류 규칙: 캠페인명이 '쿠팡 리뷰:'로 시작하거나, 제공내역에 '본인 구매' 문자열이 들어간 행은 "
-    "'본인 구매 리뷰'로 분류하여 당첨률 계산과 섹션 D(현물 실적)에서 제외하고 "
-    "별도 표 '쿠팡 리뷰 점수 작업'으로 표시합니다."
+    "'본인 구매 리뷰'로 분류하여 섹션 B(마감 임박·마감일 미입력), 섹션 C(당첨률 계산), 섹션 D(현물 실적)에서 제외하고 "
+    "별도 표 '쿠팡 리뷰 점수 작업'으로만 표시합니다."
 )
+
+
+def compute_next_scheduled_run_kst(
+    now_kst: datetime,
+    *,
+    schedule_hm: tuple[tuple[int, int], ...] = REGULAR_UPDATE_TIMES_KST,
+) -> datetime:
+    """정기 갱신 시각(기본 11:20, 17:50 KST) 중 현재 시각 이후 가장 가까운 다음 예정 시각을 계산한다."""
+    current = now_kst.astimezone(KST)
+    today = current.date()
+    sorted_hm = sorted(schedule_hm)
+    candidates: list[datetime] = []
+    for day_offset in (0, 1):
+        target_day = today + timedelta(days=day_offset)
+        for hour, minute in sorted_hm:
+            candidates.append(
+                datetime(target_day.year, target_day.month, target_day.day, hour, minute, 0, tzinfo=KST)
+            )
+    for cand in candidates:
+        if cand > current:
+            return cand
+    # 방어적 폴백 (schedule_hm이 비어 있지 않은 이상 도달하지 않음)
+    return candidates[-1]
 
 
 def is_self_purchase_review(row: ExperienceRow) -> bool:
@@ -71,10 +95,10 @@ def compute_experience_analytics(
         if status not in seen_statuses:
             ordered_statuses.append((status, status_counter[status]))
 
-    # 2) 섹션 B: 마감 임박 (상태: 당첨·리뷰대기)
+    # 2) 섹션 B: 마감 임박 및 마감일 미입력 (상태: 당첨·리뷰대기, 본인 구매 리뷰 전체 제외)
     deadlines: list[DeadlineItem] = []
     missing_deadlines: list[MissingDeadlineItem] = []
-    for row in rows:
+    for row in normal_rows:
         if row.status not in EXPERIENCE_DEADLINE_STATUSES:
             continue
         site_label = row.site or "(미입력)"

@@ -8,10 +8,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
-from . import KST, MANUAL_E_END_MARKER, MANUAL_E_START_MARKER
-from .analytics import SELF_PURCHASE_RULE_TEXT
+from . import (
+    DEFAULT_SETTLEMENT_PAGE_TITLE,
+    DEFAULT_SETTLEMENT_PAGE_URL,
+    KST,
+    MANUAL_E_END_MARKER,
+    MANUAL_E_START_MARKER,
+)
+from .analytics import SELF_PURCHASE_RULE_TEXT, compute_next_scheduled_run_kst
 from .models import CompetitionAnalytics, DashboardReport, ExperienceAnalytics
 
 MAX_RICH_TEXT_CONTENT = 2000
@@ -26,13 +32,18 @@ def make_rich_text(
     italic: bool = False,
     code: bool = False,
     color: str = "default",
+    link_url: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Notion rich_text 배열을 생성한다 (2,000자 한도 자동 분할)."""
+    link_obj = {"url": link_url} if link_url else None
     if text == "":
+        text_payload: dict[str, Any] = {"content": ""}
+        if link_obj is not None:
+            text_payload["link"] = link_obj
         return [
             {
                 "type": "text",
-                "text": {"content": ""},
+                "text": text_payload,
                 "annotations": {
                     "bold": bold,
                     "italic": italic,
@@ -53,21 +64,26 @@ def make_rich_text(
             chunks[MAX_RICH_TEXT_ELEMENTS - 1][: MAX_RICH_TEXT_CONTENT - 20] + "... (길이 제한으로 생략)"
         ]
 
-    return [
-        {
-            "type": "text",
-            "text": {"content": chunk},
-            "annotations": {
-                "bold": bold,
-                "italic": italic,
-                "strikethrough": False,
-                "underline": False,
-                "code": code,
-                "color": color,
-            },
-        }
-        for chunk in chunks
-    ]
+    result: list[dict[str, Any]] = []
+    for chunk in chunks:
+        text_payload = {"content": chunk}
+        if link_obj is not None:
+            text_payload["link"] = link_obj
+        result.append(
+            {
+                "type": "text",
+                "text": text_payload,
+                "annotations": {
+                    "bold": bold,
+                    "italic": italic,
+                    "strikethrough": False,
+                    "underline": False,
+                    "code": code,
+                    "color": color,
+                },
+            }
+        )
+    return result
 
 
 def heading_2(text: str) -> dict[str, Any]:
@@ -242,12 +258,13 @@ def build_bottom_blocks(report: DashboardReport) -> list[dict[str, Any]]:
     blocks.append(divider())
     blocks.extend(_build_section_f(report))
     blocks.append(divider())
-    blocks.extend(_build_section_g())
+    blocks.extend(_build_section_g(report))
     return blocks
 
 
 def _build_section_a(report: DashboardReport) -> list[dict[str, Any]]:
     updated_str = report.updated_at_kst.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    next_run_str = compute_next_scheduled_run_kst(report.updated_at_kst).strftime("%Y-%m-%d %H:%M KST")
 
     if report.run_status == "정상":
         emoji = "✅"
@@ -265,6 +282,7 @@ def _build_section_a(report: DashboardReport) -> list[dict[str, Any]]:
     failure_summary = "; ".join(report.failure_reasons) if report.failure_reasons else "없음"
     header_lines = [
         f"갱신 시각: {updated_str}",
+        f"다음 예정 갱신 시각: {next_run_str}",
         f"실행 결과: {report.run_status}",
         f"실패 원인: {failure_summary}",
         (
@@ -294,6 +312,48 @@ def _build_section_a(report: DashboardReport) -> list[dict[str, Any]]:
                 color="yellow_background",
             )
         )
+
+    if report.fact_alerts:
+        blocks.append(heading_3("팩트 경보"))
+        alert_lines = [
+            f"총 {len(report.fact_alerts)}건의 팩트 장부 경보가 감지되었습니다. (원문 재확인 또는 충돌 해소 필요)"
+        ]
+        blocks.append(
+            callout(
+                "\n".join(alert_lines),
+                emoji="🚨",
+                color="red_background",
+                text_color="red",
+                bold=True,
+            )
+        )
+        alert_rows: list[list[list[dict[str, Any]]]] = []
+        for alert in report.fact_alerts:
+            grade_change = (
+                f"{alert.old_grade} → {alert.new_grade}"
+                if (alert.old_grade and alert.new_grade)
+                else (alert.new_grade or "-")
+            )
+            url_cell = (
+                make_rich_text(alert.url, link_url=alert.url)
+                if alert.url
+                else make_rich_text("-")
+            )
+            alert_rows.append(
+                [
+                    make_rich_text(alert.claim or "(주장 미입력)", bold=True, color="red"),
+                    make_rich_text(alert.topic_key or "-"),
+                    make_rich_text(alert.reason, color="red"),
+                    make_rich_text(grade_change),
+                    url_cell,
+                ]
+            )
+        blocks.append(
+            table_block(
+                ["주장", "주제키", "경보 사유", "등급 변경", "근거 URL"],
+                alert_rows,
+            )
+        )
     return blocks
 
 
@@ -314,7 +374,7 @@ def _build_section_b(report: DashboardReport) -> list[dict[str, Any]]:
 
     blocks.append(
         paragraph(
-            "대상: 상태가 '당첨'·'리뷰대기'인 행 | 정렬: D-day 오름차순 | D-3 이하 빨간색 강조",
+            "대상: 상태가 '당첨'·'리뷰대기'인 행 (본인 구매 리뷰 제외) | 정렬: D-day 오름차순 | D-3 이하 빨간색 강조",
             color="gray",
         )
     )
@@ -393,12 +453,13 @@ def _build_section_c(report: DashboardReport) -> list[dict[str, Any]]:
     blocks.append(heading_3("상태별 행 수"))
     blocks.append(table_block(["상태", "행 수"], status_rows))
 
+    excluded_count = len(exp.self_purchase_reviews)
     blocks.append(heading_3("사이트별 신청·당첨 수 및 당첨률"))
     blocks.append(
         paragraph(
             "당첨률 = (당첨 + 리뷰대기 + 리뷰완료) ÷ 발표가 끝난 행(당첨 + 리뷰대기 + 리뷰완료 + 미당첨). "
             f"괄호 안 n=○은 발표가 끝난 표본 수입니다. "
-            f"'본인 구매 리뷰' {len(exp.self_purchase_reviews)}건은 당첨률 계산에서 제외합니다.",
+            f"'본인 구매 리뷰' {excluded_count}건은 당첨률 계산에서 제외합니다.",
             color="gray",
         )
     )
@@ -416,9 +477,10 @@ def _build_section_c(report: DashboardReport) -> list[dict[str, Any]]:
             ]
         )
     t = exp.total_site_stats
+    total_site_label = f"{t.site} (본인 구매 리뷰 {excluded_count}건 제외)"
     site_rows.append(
         [
-            make_rich_text(t.site, bold=True),
+            make_rich_text(total_site_label, bold=True),
             make_rich_text(str(t.applied_count), bold=True),
             make_rich_text(str(t.won_count), bold=True),
             make_rich_text(str(t.lost_count), bold=True),
@@ -604,22 +666,83 @@ def _build_section_f(report: DashboardReport) -> list[dict[str, Any]]:
     return blocks
 
 
-def _build_section_g() -> list[dict[str, Any]]:
-    return [
-        heading_2("G. 정산"),
+def _settlement_link_paragraph(title: str, url: str) -> dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": (
+                make_rich_text("정산판: ", bold=True)
+                + make_rich_text(title, bold=True, link_url=url)
+                + make_rich_text(f" ({url})", color="gray")
+            ),
+            "color": "default",
+        },
+    }
+
+
+def _build_section_g(report: DashboardReport) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [heading_2("G. 정산")]
+    s = report.settlement_summary
+
+    if s is None:
+        blocks.append(_settlement_link_paragraph(DEFAULT_SETTLEMENT_PAGE_TITLE, DEFAULT_SETTLEMENT_PAGE_URL))
+        blocks.append(
+            callout(
+                "정산: 수동 확인\n(정산판 구조 미확인 — 정산판 링크에서 직접 확인하세요.)",
+                emoji="🧾",
+                color="gray_background",
+            )
+        )
+        return blocks
+
+    blocks.append(_settlement_link_paragraph(s.title, s.url))
+
+    if s.structured:
+        summary_text = "\n".join(s.summary_lines) if s.summary_lines else "정산판 구조화 데이터를 원문 그대로 요약했습니다."
+        blocks.append(
+            callout(
+                f"정산판 핵심 요약 (원문 기준, 추측·임의 합산 없음)\n{summary_text}",
+                emoji="🧾",
+                color="blue_background",
+            )
+        )
+        if s.table_headers:
+            if s.table_rows:
+                rendered_rows = [
+                    [make_rich_text(cell) for cell in row]
+                    for row in s.table_rows
+                ]
+                blocks.append(table_block(s.table_headers, rendered_rows))
+            else:
+                blocks.append(paragraph("정산판 구조화 데이터에 표시할 행이 없습니다.", color="gray"))
+        return blocks
+
+    # 비구조화 페이지, 접근 불가, 또는 미설정: 링크 유지 + '수동 확인' 유지
+    note_lines = ["정산: 수동 확인"]
+    if s.error_message:
+        note_lines.append(f"정산판 조회 실패: {s.error_message}")
+    elif s.summary_lines:
+        note_lines.extend(s.summary_lines)
+    else:
+        note_lines.append("구조화된 DB/표가 확인되지 않아 수동 확인을 유지합니다.")
+    blocks.append(
         callout(
-            "정산: 수동 확인\n(정산판 위치 미확인 — P1에서는 자동 집계하지 않고 수동 확인으로 표시합니다.)",
+            "\n".join(note_lines),
             emoji="🧾",
             color="gray_background",
-        ),
-    ]
+        )
+    )
+    return blocks
 
 
 def format_cli_summary(report: DashboardReport) -> str:
     """실행 결과 콘솔 요약 문자열을 생성한다 (--dry-run 및 실행 로그용)."""
     updated_str = report.updated_at_kst.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    next_run_str = compute_next_scheduled_run_kst(report.updated_at_kst).strftime("%Y-%m-%d %H:%M KST")
     lines = [
         f"[꿀통 대시보드] 갱신 시각: {updated_str}",
+        f"다음 예정 갱신 시각: {next_run_str}",
         f"실행 결과: {report.run_status}",
         f"실패 원인: {'; '.join(report.failure_reasons) if report.failure_reasons else '없음'}",
     ]
@@ -627,6 +750,10 @@ def format_cli_summary(report: DashboardReport) -> str:
         lines.append("경고:")
         for w in report.warnings:
             lines.append(f"  - {w}")
+    if report.fact_alerts:
+        lines.append(f"팩트 경보: {len(report.fact_alerts)}건")
+        for alert in report.fact_alerts:
+            lines.append(f"  - [{alert.topic_key}] {alert.claim}: {alert.reason}")
     if report.experience_analytics is not None:
         exp: ExperienceAnalytics = report.experience_analytics
         urgent = sum(1 for d in exp.deadlines if d.is_urgent)
@@ -647,5 +774,11 @@ def format_cli_summary(report: DashboardReport) -> str:
     else:
         lines.append("경쟁 기록 DB: 조회 실패 (이전 숫자 미표시)")
 
-    lines.append("정산: 수동 확인")
+    if report.settlement_summary and report.settlement_summary.structured:
+        lines.append(
+            f"정산: 구조화 요약 연결 ({report.settlement_summary.structure_type}, {report.settlement_summary.url})"
+        )
+    else:
+        url = report.settlement_summary.url if report.settlement_summary else DEFAULT_SETTLEMENT_PAGE_URL
+        lines.append(f"정산: 수동 확인 ({url})")
     return "\n".join(lines)
