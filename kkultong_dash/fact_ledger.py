@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import html
+import http.client
 import re
 import time
 import urllib.error
@@ -426,7 +427,10 @@ def normalize_whitespace(text: str) -> str:
 
 def is_login_url(url: str) -> bool:
     """리다이렉트된 URL이 로그인/인증 페이지인지 판별한다."""
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
     host = (parsed.hostname or "").lower()
     path = (parsed.path or "").lower()
     if any(host.startswith(prefix) for prefix in _LOGIN_URL_HOST_PREFIXES):
@@ -434,6 +438,66 @@ def is_login_url(url: str) -> bool:
     if any(marker in path for marker in _LOGIN_URL_PATH_MARKERS):
         return True
     return False
+
+
+def normalize_fetch_url(url: str) -> tuple[Optional[str], Optional[str]]:
+    """웹 요청 전 URL을 검증하고 비ASCII 문자를 안전하게 인코딩한다.
+
+    반환값: (정규화된 ASCII URL 또는 None, 실패 사유 또는 None)
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None, "빈 URL"
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return None, "URL에 제어 문자가 포함되어 있습니다"
+
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError as exc:
+        return None, f"URL 파싱 실패: {exc}"
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        return None, "유효하지 않은 URL 형식"
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return None, f"유효하지 않은 포트: {exc}"
+
+    host = parsed.hostname
+    if any(ch.isspace() for ch in host):
+        return None, "호스트에 공백이 포함되어 있습니다"
+    try:
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        return None, f"호스트 인코딩 실패: {exc}"
+
+    host_part = f"[{ascii_host}]" if ":" in ascii_host and not ascii_host.startswith("[") else ascii_host
+
+    userinfo = ""
+    if parsed.username is not None:
+        user_enc = urllib.parse.quote(parsed.username, safe="-._~!$&'()*+,;=")
+        if parsed.password is not None:
+            pass_enc = urllib.parse.quote(parsed.password, safe="-._~!$&'()*+,;=")
+            userinfo = f"{user_enc}:{pass_enc}@"
+        else:
+            userinfo = f"{user_enc}@"
+
+    netloc = f"{userinfo}{host_part}"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    path = urllib.parse.quote(parsed.path, safe="/:@!$&'()*+,;=-._~%")
+    query = urllib.parse.quote(parsed.query, safe="/?:@!$&'()*+,;=-._~%")
+    fragment = urllib.parse.quote(parsed.fragment, safe="/?:@!$&'()*+,;=-._~%")
+
+    normalized = urllib.parse.urlunsplit((scheme, netloc, path, query, fragment))
+    try:
+        normalized.encode("ascii")
+    except UnicodeEncodeError as exc:
+        return None, f"URL ASCII 인코딩 실패: {exc}"
+    return normalized, None
 
 
 def has_login_wall_signal(raw_body: str, visible_text: str) -> bool:
@@ -445,14 +509,23 @@ def has_login_wall_signal(raw_body: str, visible_text: str) -> bool:
 
 
 def _default_web_transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
-    req = urllib.request.Request(url=url, headers=headers, method="GET")
+    normalized_url, norm_err = normalize_fetch_url(url)
+    if norm_err or not normalized_url:
+        return RawWebResponse(
+            status=0,
+            final_url=url,
+            headers={},
+            body="",
+            error=f"URL 정규화 실패: {norm_err or '유효하지 않은 URL'}",
+        )
     try:
+        req = urllib.request.Request(url=normalized_url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
             raw = resp.read().decode("utf-8", errors="replace")
             return RawWebResponse(
                 status=resp.status,
-                final_url=resp.geturl() or url,
+                final_url=resp.geturl() or normalized_url,
                 headers=resp_headers,
                 body=raw,
             )
@@ -461,14 +534,14 @@ def _default_web_transport(url: str, headers: dict[str, str], timeout: float) ->
         raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         return RawWebResponse(
             status=exc.code,
-            final_url=exc.geturl() or url,
+            final_url=exc.geturl() or normalized_url,
             headers=resp_headers,
             body=raw,
         )
     except urllib.error.URLError as exc:
         return RawWebResponse(
             status=0,
-            final_url=url,
+            final_url=normalized_url,
             headers={},
             body="",
             error=f"네트워크 오류: {exc.reason}",
@@ -476,10 +549,18 @@ def _default_web_transport(url: str, headers: dict[str, str], timeout: float) ->
     except TimeoutError:
         return RawWebResponse(
             status=0,
-            final_url=url,
+            final_url=normalized_url,
             headers={},
             body="",
             error=f"요청 타임아웃({timeout}초 초과)",
+        )
+    except (UnicodeError, ValueError, http.client.HTTPException, OSError) as exc:
+        return RawWebResponse(
+            status=0,
+            final_url=normalized_url,
+            headers={},
+            body="",
+            error=f"요청 처리 오류({type(exc).__name__}): {exc}",
         )
 
 
@@ -527,7 +608,11 @@ class PoliteWebFetcher:
 
         robots_url = f"{origin}/robots.txt"
         headers = {"User-Agent": self.user_agent, "Accept": "text/plain,*/*;q=0.8"}
-        resp = self._transport(robots_url, headers, self.timeout_sec)
+        try:
+            resp = self._transport(robots_url, headers, self.timeout_sec)
+        except Exception:
+            self._robots_cache[origin] = None
+            return None
 
         if resp.error or resp.status == 0:
             # robots.txt 조회 자체가 네트워크 오류이면 보수적으로 None 처리 (본 요청에서 오류 기록)
@@ -548,25 +633,26 @@ class PoliteWebFetcher:
         return rp
 
     def fetch(self, url: str) -> WebFetchResult:
-        """단일 근거 URL을 robots.txt와 호스트 지연을 지켜 읽기 전용으로 조회한다."""
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        """단일 근거 URL을 검증·정규화한 뒤 robots.txt와 호스트 지연을 지켜 읽기 전용으로 조회한다."""
+        normalized_url, norm_err = normalize_fetch_url(url)
+        if norm_err or not normalized_url:
             return WebFetchResult(
                 kind="open_failed",
                 requested_url=url,
                 final_url=url,
-                detail="유효하지 않은 URL 형식",
+                detail=norm_err or "유효하지 않은 URL 형식",
             )
 
+        parsed = urllib.parse.urlsplit(normalized_url)
         host = (parsed.hostname or parsed.netloc).lower()
         rp = self._get_robots_parser(parsed.scheme, parsed.netloc)
         crawl_delay: Optional[float] = None
         if rp is not None:
-            if not rp.can_fetch(self.user_agent, url):
+            if not rp.can_fetch(self.user_agent, normalized_url):
                 return WebFetchResult(
                     kind="robots_blocked",
                     requested_url=url,
-                    final_url=url,
+                    final_url=normalized_url,
                     detail="robots.txt 정책에 따라 자동 접근을 중단함",
                 )
             cd = rp.crawl_delay(self.user_agent)
@@ -578,18 +664,26 @@ class PoliteWebFetcher:
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         }
-        resp = self._transport(url, headers, self.timeout_sec)
+        try:
+            resp = self._transport(normalized_url, headers, self.timeout_sec)
+        except Exception as exc:
+            return WebFetchResult(
+                kind="open_failed",
+                requested_url=url,
+                final_url=normalized_url,
+                detail=f"요청 중 예외 발생({type(exc).__name__}): {exc}",
+            )
 
         if resp.error or resp.status == 0:
             return WebFetchResult(
                 kind="open_failed",
                 requested_url=url,
-                final_url=resp.final_url or url,
+                final_url=resp.final_url or normalized_url,
                 status_code=resp.status or None,
                 detail=resp.error or "연결 실패",
             )
 
-        final_url = resp.final_url or url
+        final_url = resp.final_url or normalized_url
         visible = extract_visible_text(resp.body)
         login_wall = has_login_wall_signal(resp.body, visible)
 
@@ -602,7 +696,7 @@ class PoliteWebFetcher:
                 detail="HTTP 401 인증 필요",
             )
 
-        if final_url != url and is_login_url(final_url):
+        if final_url != normalized_url and is_login_url(final_url):
             return WebFetchResult(
                 kind="login_required",
                 requested_url=url,
@@ -637,7 +731,7 @@ class PoliteWebFetcher:
                 detail=f"HTTP {resp.status} 오류",
             )
 
-        if is_login_url(url) and login_wall:
+        if is_login_url(normalized_url) and login_wall:
             return WebFetchResult(
                 kind="login_required",
                 requested_url=url,
@@ -888,6 +982,10 @@ class RevalidationOutcome:
     updated_page_count: int
     skipped_login_count: int
     summary_text: str
+    success_count: int = 0
+    failure_count: int = 0
+    row_exception_count: int = 0
+    update_failed_count: int = 0
 
 
 def revalidate_fact_ledger(
@@ -931,38 +1029,57 @@ def revalidate_fact_ledger(
     effective_grades: dict[str, Optional[str]] = {r.page_id: r.grade for r in rows}
     alerts: list[FactAlert] = []
     skipped_login_count = 0
+    row_exception_count = 0
 
     for row in rows:
         if row.grade not in FACT_LEDGER_REVALIDATE_TARGET_GRADES:
             continue
 
-        if not row.source_url:
-            decision = judge_revalidation(row, None)
-        elif cache.is_url_in_skip_list(row.source_url):
-            skipped_login_count += 1
-            decision = judge_revalidation(row, None, already_in_skip_list=True)
-        else:
-            fetch_res = web_fetcher.fetch(row.source_url)
-            decision = judge_revalidation(row, fetch_res)
+        try:
+            if not row.source_url:
+                decision = judge_revalidation(row, None)
+            elif cache.is_url_in_skip_list(row.source_url):
+                skipped_login_count += 1
+                decision = judge_revalidation(row, None, already_in_skip_list=True)
+            else:
+                fetch_res = web_fetcher.fetch(row.source_url)
+                decision = judge_revalidation(row, fetch_res)
+
+            if decision.add_to_skip_list and row.source_url and not dry_run:
+                cache.add_url_to_skip_list(
+                    row.source_url,
+                    page_id=row.page_id,
+                    reason="로그인 필요",
+                    added_at_kst=current_kst,
+                )
+
+            props: dict[str, Any] = {
+                "자동 재검증 시각": {"date": {"start": current_iso}},
+                "자동 재검증 결과": {"select": {"name": decision.result}},
+            }
+            if decision.new_grade and decision.new_grade != decision.old_grade:
+                assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
+                props["등급"] = {"select": {"name": decision.new_grade}}
+        except ReadOnlyGuardError:
+            raise
+        except Exception as exc:
+            row_exception_count += 1
+            decision = RevalidationDecision(
+                page_id=row.page_id,
+                old_grade=row.grade,
+                new_grade=row.grade,
+                result="페이지 열림 실패",
+                add_to_fact_alerts=False,
+                add_to_skip_list=False,
+                detail=f"행 처리 예외 격리({type(exc).__name__}): {exc}",
+            )
+            props = {
+                "자동 재검증 시각": {"date": {"start": current_iso}},
+                "자동 재검증 결과": {"select": {"name": decision.result}},
+            }
 
         decisions.append(decision)
         effective_grades[row.page_id] = decision.new_grade
-
-        if decision.add_to_skip_list and row.source_url and not dry_run:
-            cache.add_url_to_skip_list(
-                row.source_url,
-                page_id=row.page_id,
-                reason="로그인 필요",
-                added_at_kst=current_kst,
-            )
-
-        props: dict[str, Any] = {
-            "자동 재검증 시각": {"date": {"start": current_iso}},
-            "자동 재검증 결과": {"select": {"name": decision.result}},
-        }
-        if decision.new_grade and decision.new_grade != decision.old_grade:
-            assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
-            props["등급"] = {"select": {"name": decision.new_grade}}
         pending_props[row.page_id] = props
 
         if decision.add_to_fact_alerts:
@@ -1021,15 +1138,24 @@ def revalidate_fact_ledger(
         )
 
     updated_count = 0
+    update_failed_count = 0
     if not dry_run:
         for page_id, props in pending_props.items():
-            client.update_fact_ledger_page(page_id, props, data_source_id=ds_id)
-            updated_count += 1
+            try:
+                client.update_fact_ledger_page(page_id, props, data_source_id=ds_id)
+                updated_count += 1
+            except ReadOnlyGuardError:
+                raise
+            except Exception:
+                update_failed_count += 1
         cache.replace_fact_alerts(alerts, checked_at_kst=current_kst)
 
     result_counts: dict[str, int] = defaultdict(int)
     for d in decisions:
         result_counts[d.result] += 1
+
+    failure_count = result_counts["페이지 열림 실패"]
+    success_count = len(decisions) - failure_count
 
     lines = [
         f"[팩트 장부 재검증] 실행 시각: {detected_at_str}",
@@ -1041,6 +1167,11 @@ def revalidate_fact_ledger(
             f"발췌 사라짐 {result_counts['발췌 사라짐']}건 | "
             f"페이지 열림 실패 {result_counts['페이지 열림 실패']}건 | "
             f"로그인 필요 {result_counts['로그인 필요']}건(목록 스킵 {skipped_login_count}건)"
+        ),
+        (
+            "행 처리 요약: "
+            f"성공 {success_count}건 | 실패 {failure_count}건 "
+            f"(예외 격리 {row_exception_count}건, 노션 갱신 실패 {update_failed_count}건)"
         ),
         f"충돌(불일치) 판정: {len(conflicts)}건 | 팩트 경보: {len(alerts)}건 | 노션 갱신: {updated_count}건",
     ]
@@ -1059,4 +1190,8 @@ def revalidate_fact_ledger(
         updated_page_count=updated_count,
         skipped_login_count=skipped_login_count,
         summary_text="\n".join(lines),
+        success_count=success_count,
+        failure_count=failure_count,
+        row_exception_count=row_exception_count,
+        update_failed_count=update_failed_count,
     )

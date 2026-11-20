@@ -35,7 +35,7 @@ from .parsers import (
     parse_fact_ledger_row,
 )
 
-_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'`,;]+")
+_URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'`,;“”‘’「」『』（）【】《》]+")
 _UUID_LIKE_RE = re.compile(
     r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
@@ -141,31 +141,125 @@ def _is_trashed(obj: dict[str, Any]) -> bool:
     return bool(obj.get("in_trash") or obj.get("is_archived") or obj.get("archived"))
 
 
+_LEADING_URL_WRAP = "([<{`'\"“‘「『（【《"
+_TRAILING_URL_PUNCT = ".,;:!?`'\"”’」』）】》"
+_MATCHED_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
+_TRAILING_KOREAN_PARTICLES: tuple[str, ...] = (
+    "에서는",
+    "에서도",
+    "으로는",
+    "으로서",
+    "으로써",
+    "이라고",
+    "이라는",
+    "이라도",
+    "에서",
+    "에게",
+    "으로",
+    "부터",
+    "까지",
+    "처럼",
+    "보다",
+    "마다",
+    "라고",
+    "라는",
+    "이며",
+    "이고",
+    "이나",
+    "라도",
+    "이다",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "의",
+    "에",
+    "와",
+    "과",
+    "도",
+    "만",
+    "로",
+)
+
+
+def _is_hangul(ch: str) -> bool:
+    code = ord(ch)
+    return (0xAC00 <= code <= 0xD7A3) or (0x1100 <= code <= 0x11FF) or (0x3130 <= code <= 0x318F)
+
+
+def _clean_url(raw: str) -> str:
+    """URL 끝부분의 한국어 조사, 괄호, 따옴표, 마침표 등을 반복 제거한다."""
+    cleaned = (raw or "").strip().lstrip(_LEADING_URL_WRAP)
+    while cleaned:
+        prev = cleaned
+        cleaned = cleaned.rstrip(_TRAILING_URL_PUNCT)
+        while cleaned and cleaned[-1] in _MATCHED_CLOSERS:
+            closer = cleaned[-1]
+            opener = _MATCHED_CLOSERS[closer]
+            if cleaned.count(closer) > cleaned.count(opener):
+                cleaned = cleaned[:-1]
+            else:
+                break
+        for particle in _TRAILING_KOREAN_PARTICLES:
+            if cleaned.endswith(particle) and len(cleaned) > len(particle):
+                prefix_char = cleaned[-len(particle) - 1]
+                if not _is_hangul(prefix_char):
+                    cleaned = cleaned[: -len(particle)]
+                    break
+        if cleaned == prev:
+            break
+    return cleaned
+
+
 def _is_external_evidence_url(url: str) -> bool:
-    parsed = urllib.parse.urlsplit(url.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return False
     host = (parsed.hostname or "").lower()
+    if not host or "." not in host or host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    try:
+        _ = parsed.port
+        host.encode("idna")
+    except (ValueError, UnicodeError):
+        return False
     if host in _INTERNAL_NOTION_HOSTS or host.endswith(".notion.site"):
+        return False
+    # 경로가 비어 있거나 '/'만 있는 루트 도메인 URL은 근거로 채택하지 않는다
+    if not parsed.path.strip("/") and not parsed.query:
         return False
     return True
 
 
-def _clean_url(raw: str) -> str:
-    return raw.strip().rstrip(".,;:)]}>'\"")
+def sanitize_evidence_url(raw: str) -> Optional[str]:
+    """URL 후보를 정리·파싱 검증한 뒤 근거로 채택 가능한 URL만 반환한다."""
+    cleaned = _clean_url(raw)
+    if not _is_external_evidence_url(cleaned):
+        return None
+    return cleaned
 
 
 def _extract_urls_from_text_and_rt(text: str, rich_text: Any = None) -> tuple[str, ...]:
     found: list[str] = []
     seen: set[str] = set()
     for link in extract_rich_text_links(rich_text):
-        cleaned = _clean_url(link)
-        if _is_external_evidence_url(cleaned) and cleaned not in seen:
+        cleaned = sanitize_evidence_url(link)
+        if cleaned and cleaned not in seen:
             seen.add(cleaned)
             found.append(cleaned)
     for match in _URL_RE.findall(text or ""):
-        cleaned = _clean_url(match)
-        if _is_external_evidence_url(cleaned) and cleaned not in seen:
+        cleaned = sanitize_evidence_url(match)
+        if cleaned and cleaned not in seen:
             seen.add(cleaned)
             found.append(cleaned)
     return tuple(found)
@@ -302,14 +396,15 @@ def read_page_units(
                         )
                     )
             elif btype == "bookmark":
-                url = str(body.get("url") or "").strip()
+                raw_url = str(body.get("url") or "").strip()
+                cleaned_url = sanitize_evidence_url(raw_url)
                 caption = extract_rich_text_plain(body.get("caption")).strip()
-                urls = (url,) if _is_external_evidence_url(url) else ()
+                urls = (cleaned_url,) if cleaned_url else ()
                 if urls or caption:
                     units.append(
                         DocumentUnit(
                             kind="text",
-                            text=caption or url,
+                            text=caption or (cleaned_url or raw_url),
                             heading_context=heading_stack[0],
                             urls=urls,
                         )
@@ -337,7 +432,10 @@ def _detect_platforms_in_text(text: str) -> list[str]:
 
 
 def _detect_platform_by_url(url: str) -> Optional[str]:
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return None
     for canonical, _slug, _aliases, domains in _PLATFORM_SPECS:
         if any(host == d or host.endswith("." + d) for d in domains):
             return canonical
@@ -375,7 +473,10 @@ def extract_v2_platform_urls(v2_units: list[DocumentUnit]) -> dict[str, list[str
         heading_platforms = _detect_platforms_in_text(unit.heading_context)
         context_platforms = text_platforms or heading_platforms
 
-        for url in unit.urls:
+        for raw_url in unit.urls:
+            url = sanitize_evidence_url(raw_url)
+            if not url:
+                continue
             by_domain = _detect_platform_by_url(url)
             targets = [by_domain] if by_domain else context_platforms
             for plat in targets:
@@ -394,11 +495,13 @@ def _pick_v2_source_url(
 ) -> Optional[str]:
     """v2 페이지에 기재된 근거 URL만 선택한다. 근거가 없으면 None을 반환한다."""
     if is_from_v2 and unit_urls:
-        # 같은 줄/행에 해당 플랫폼 도메인 URL이 있으면 최우선
-        for u in unit_urls:
-            if _detect_platform_by_url(u) == platform:
-                return u
-        return unit_urls[0]
+        sanitized = [u for raw in unit_urls if (u := sanitize_evidence_url(raw))]
+        if sanitized:
+            # 같은 줄/행에 해당 플랫폼 도메인 URL이 있으면 최우선
+            for u in sanitized:
+                if _detect_platform_by_url(u) == platform:
+                    return u
+            return sanitized[0]
 
     candidates = v2_platform_urls.get(platform) or []
     if not candidates:

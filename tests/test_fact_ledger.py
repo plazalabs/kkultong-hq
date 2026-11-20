@@ -25,12 +25,15 @@ from kkultong_dash.fact_ledger import (
     detect_fact_conflicts,
     ensure_fact_ledger_database,
     judge_revalidation,
+    normalize_fetch_url,
     revalidate_fact_ledger,
 )
 from kkultong_dash.fact_seed import (
     DocumentUnit,
     extract_platform_seed_candidates,
+    read_page_units,
     run_fact_seed,
+    sanitize_evidence_url,
 )
 from kkultong_dash.models import DashboardReport, FactLedgerRow, SourceSyncResult
 from kkultong_dash.notion_client import HTTPResponse, NotionClient, ReadOnlyGuardError
@@ -918,6 +921,259 @@ class TestFactLedgerP2(unittest.TestCase):
             self.assertTrue(out2.ok)
             self.assertEqual(out2.created_count, 0)
             self.assertEqual(out2.skipped_existing_count, 2)
+
+    # ------------------------------------------------------------------
+    # 6) 긴급 수정 1 회귀 테스트: 비ASCII URL 정규화·실패 격리 + 행 단위 예외 격리
+    # ------------------------------------------------------------------
+
+    def test_revalidation_non_ascii_url_marks_only_that_row_failed_and_completes_batch(self) -> None:
+        broken_url = "http://help.medium.com/hc/en-us/articles/39121627791639)는"
+        expected_encoded_url = "http://help.medium.com/hc/en-us/articles/39121627791639)%EB%8A%94"
+        valid_url = "https://docs.example/pricing"
+
+        # 1) URL 정규화기: 비ASCII 경로는 안전한 ASCII URL로 인코딩, 인코딩 불가 호스트는 None 반환
+        norm_ok, err_ok = normalize_fetch_url(broken_url)
+        self.assertIsNone(err_ok)
+        self.assertEqual(norm_ok, expected_encoded_url)
+        norm_ok.encode("ascii")  # UnicodeEncodeError 없이 ASCII 인코딩 가능해야 함
+
+        norm_bad, err_bad = normalize_fetch_url("http://한글..invalid/path")
+        self.assertIsNone(norm_bad)
+        self.assertIsNotNone(err_bad)
+
+        # 2) 전체 재검증 배치: 비ASCII URL 행만 '페이지 열림 실패', 나머지 행은 정상 처리되어 끝까지 완료
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        requested_urls: list[str] = []
+
+        def strict_ascii_transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
+            # urllib와 동일하게 비ASCII URL이 그대로 내려오면 UnicodeEncodeError를 발생시킴
+            url.encode("ascii")
+            requested_urls.append(url)
+            if url.endswith("/robots.txt"):
+                return RawWebResponse(200, url, {}, "User-agent: *\nAllow: /\n")
+            if url == expected_encoded_url:
+                return RawWebResponse(404, url, {}, "Not Found")
+            if url == valid_url:
+                return RawWebResponse(
+                    200,
+                    url,
+                    {},
+                    "<html><body><p>Gumroad charges a flat 10% fee.</p></body></html>",
+                )
+            return RawWebResponse(404, url, {}, "Not Found")
+
+        fetcher = PoliteWebFetcher(
+            host_delay_sec=0.0,
+            transport=strict_ascii_transport,
+            sleep_fn=lambda _: None,
+        )
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+
+            server.add_fact_row(
+                ds_id,
+                "fact-broken-non-ascii",
+                claim="Medium 깨진 비ASCII URL 행",
+                topic_key="medium.mpp.broken",
+                value="멤버십 불필요",
+                source_url=broken_url,
+                excerpt="You no longer need to be a Medium member.",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "fact-valid-row",
+                claim="Gumroad 수수료 10%",
+                topic_key="gumroad.fee",
+                value="10%",
+                source_url=valid_url,
+                excerpt="Gumroad charges a flat 10% fee.",
+                grade="확인됨",
+            )
+
+            outcome = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+
+            self.assertEqual(outcome.evaluated_rows, 2)
+            self.assertEqual(outcome.updated_page_count, 2)
+            self.assertEqual(outcome.success_count, 1)
+            self.assertEqual(outcome.failure_count, 1)
+            self.assertIn("성공 1건 | 실패 1건", outcome.summary_text)
+            self.assertIn(expected_encoded_url, requested_urls)
+
+            p_broken = server.pages["fact-broken-non-ascii"]["properties"]
+            p_valid = server.pages["fact-valid-row"]["properties"]
+            self.assertEqual(p_broken["자동 재검증 결과"]["select"]["name"], "페이지 열림 실패")
+            self.assertEqual(p_broken["등급"]["select"]["name"], "원문대조필요")
+            self.assertEqual(p_valid["자동 재검증 결과"]["select"]["name"], "발췌 그대로")
+            self.assertEqual(p_valid["등급"]["select"]["name"], "확인됨")
+
+    def test_revalidation_isolates_per_row_exceptions_and_reports_counts(self) -> None:
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        class ExplodingFetcher(PoliteWebFetcher):
+            def fetch(self, url: str) -> WebFetchResult:
+                if "boom.example" in url:
+                    raise RuntimeError("simulated unexpected per-row crash")
+                return WebFetchResult(
+                    kind="ok",
+                    requested_url=url,
+                    final_url=url,
+                    status_code=200,
+                    visible_text="Substack takes a 10% cut.",
+                )
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+
+            server.add_fact_row(
+                ds_id,
+                "fact-boom",
+                claim="예외 발생 행",
+                topic_key="boom.metric",
+                value="99%",
+                source_url="https://boom.example/page",
+                excerpt="99%",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "fact-ok-after-boom",
+                claim="Substack 수수료 10%",
+                topic_key="substack.fee",
+                value="10%",
+                source_url="https://substack.example/pricing",
+                excerpt="Substack takes a 10% cut.",
+                grade="확인됨",
+            )
+
+            outcome = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=ExplodingFetcher(host_delay_sec=0.0),
+            )
+
+            self.assertEqual(outcome.evaluated_rows, 2)
+            self.assertEqual(outcome.success_count, 1)
+            self.assertEqual(outcome.failure_count, 1)
+            self.assertEqual(outcome.row_exception_count, 1)
+            self.assertEqual(outcome.updated_page_count, 2)
+            self.assertIn("성공 1건 | 실패 1건", outcome.summary_text)
+            self.assertIn("예외 격리 1건", outcome.summary_text)
+
+            self.assertEqual(
+                server.pages["fact-boom"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "페이지 열림 실패",
+            )
+            self.assertEqual(
+                server.pages["fact-ok-after-boom"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "발췌 그대로",
+            )
+
+    # ------------------------------------------------------------------
+    # 7) 긴급 수정 2 단위 테스트: 시드 근거 URL 위생(조사·괄호·따옴표·마침표 제거 + 루트 도메인 거부)
+    # ------------------------------------------------------------------
+
+    def test_seed_url_sanitization_strips_korean_particles_punctuation_and_rejects_bare_domain(self) -> None:
+        # 한국어 조사·닫는 괄호·따옴표·마침표가 붙은 깨진 URL 정리
+        self.assertEqual(
+            sanitize_evidence_url("http://help.medium.com/hc/en-us/articles/39121627791639)는"),
+            "http://help.medium.com/hc/en-us/articles/39121627791639",
+        )
+        self.assertEqual(
+            sanitize_evidence_url('"https://gumroad.com/pricing"에서.'),
+            "https://gumroad.com/pricing",
+        )
+        self.assertEqual(
+            sanitize_evidence_url("(https://support.patreon.com/hc/en-us/articles/fees)."),
+            "https://support.patreon.com/hc/en-us/articles/fees",
+        )
+        self.assertEqual(
+            sanitize_evidence_url("https://help.medium.com/hc/en-us/articles/39121627791639”의"),
+            "https://help.medium.com/hc/en-us/articles/39121627791639",
+        )
+
+        # 경로가 '/'뿐인 루트 도메인 URL 및 파싱 불가 문자열은 근거로 채택 금지
+        self.assertIsNone(sanitize_evidence_url("http://help.medium.com/"))
+        self.assertIsNone(sanitize_evidence_url("https://help.medium.com"))
+        self.assertIsNone(sanitize_evidence_url("http://help.medium.com/)는"))
+        self.assertIsNone(sanitize_evidence_url("not-a-valid-url"))
+        self.assertIsNone(sanitize_evidence_url("http://bad host/articles/123"))
+
+    def test_seed_extraction_cleans_broken_urls_and_marks_bare_domain_rows_unverified(self) -> None:
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        server.add_page(
+            "seed-v1-hygiene",
+            "C 갈래 영어 시범 — 작업 분할 v1",
+            parent_page_id="hub-parent-1",
+            blocks=[],
+        )
+        server.add_page(
+            "seed-v2-hygiene",
+            "원소스 멀티유즈 워크플로우 v2",
+            parent_page_id="hub-parent-1",
+            blocks=[
+                {
+                    "object": "block",
+                    "id": "b-medium-particle",
+                    "type": "paragraph",
+                    "in_trash": False,
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "plain_text": "Medium 멤버십: 월 $5 (http://help.medium.com/hc/en-us/articles/39121627791639)는 공식 안내 기준.",
+                                "href": "http://help.medium.com/hc/en-us/articles/39121627791639)는",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "object": "block",
+                    "id": "b-bare-domain",
+                    "type": "paragraph",
+                    "in_trash": False,
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "plain_text": "Gumroad 수수료: 10% (http://help.medium.com/)",
+                                "href": "http://help.medium.com/",
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+        v1_units = read_page_units(client, "seed-v1-hygiene")
+        v2_units = read_page_units(client, "seed-v2-hygiene")
+        candidates = extract_platform_seed_candidates(v1_units, v2_units, uploader="뮤즈")
+        by_platform = {c.platform: c for c in candidates}
+
+        # 조사·괄호가 제거된 유효 URL은 근거로 채택('원문대조필요')
+        self.assertEqual(
+            by_platform["Medium"].source_url,
+            "http://help.medium.com/hc/en-us/articles/39121627791639",
+        )
+        self.assertEqual(by_platform["Medium"].grade, "원문대조필요")
+
+        # 경로가 '/'뿐인 루트 도메인 URL만 있는 수치 행은 근거 없음 + 등급 '미확인'
+        self.assertIsNone(by_platform["Gumroad"].source_url)
+        self.assertEqual(by_platform["Gumroad"].grade, "미확인")
 
 
 if __name__ == "__main__":
