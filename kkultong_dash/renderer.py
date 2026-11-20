@@ -11,10 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 from . import KST, MANUAL_E_END_MARKER, MANUAL_E_START_MARKER
+from .analytics import SELF_PURCHASE_RULE_TEXT
 from .models import CompetitionAnalytics, DashboardReport, ExperienceAnalytics
 
 MAX_RICH_TEXT_CONTENT = 2000
 MAX_RICH_TEXT_ELEMENTS = 100
+VERIFY_GRADE_WARNING_TEXT = "자기 신고 등급 — 정확도 아님, 정확도는 P3 성적표에서"
 
 
 def make_rich_text(
@@ -395,7 +397,8 @@ def _build_section_c(report: DashboardReport) -> list[dict[str, Any]]:
     blocks.append(
         paragraph(
             "당첨률 = (당첨 + 리뷰대기 + 리뷰완료) ÷ 발표가 끝난 행(당첨 + 리뷰대기 + 리뷰완료 + 미당첨). "
-            "괄호 안 n=○은 발표가 끝난 표본 수입니다.",
+            f"괄호 안 n=○은 발표가 끝난 표본 수입니다. "
+            f"'본인 구매 리뷰' {len(exp.self_purchase_reviews)}건은 당첨률 계산에서 제외합니다.",
             color="gray",
         )
     )
@@ -450,7 +453,7 @@ def _build_section_d(report: DashboardReport) -> list[dict[str, Any]]:
 
     blocks.append(
         paragraph(
-            f"대상: 상태가 '당첨'·'리뷰대기'·'리뷰완료'인 행 (총 {len(exp.rewards)}건) | "
+            f"대상: 상태가 '당첨'·'리뷰대기'·'리뷰완료'인 행 중 본인 구매 리뷰 제외 (총 {len(exp.rewards)}건) | "
             "제공내역은 DB 원문 그대로 표기하며 금액을 추정하거나 합산하지 않습니다.",
             color="gray",
         )
@@ -469,6 +472,24 @@ def _build_section_d(report: DashboardReport) -> list[dict[str, Any]]:
         blocks.append(table_block(["캠페인명", "사이트", "상태", "제공내역 (원문)"], reward_rows))
     else:
         blocks.append(paragraph("당첨·리뷰대기·리뷰완료 행이 없습니다."))
+
+    blocks.append(heading_3("쿠팡 리뷰 점수 작업"))
+    blocks.append(paragraph(SELF_PURCHASE_RULE_TEXT, color="gray"))
+    if exp.self_purchase_reviews:
+        self_purchase_rows = [
+            [
+                make_rich_text(item.campaign_name),
+                make_rich_text(item.site),
+                make_rich_text(item.status),
+                make_rich_text(item.reward_text or "(미입력)"),
+            ]
+            for item in exp.self_purchase_reviews
+        ]
+        blocks.append(
+            table_block(["캠페인명", "사이트", "상태", "제공내역 (원문)"], self_purchase_rows)
+        )
+    else:
+        blocks.append(paragraph("본인 구매 리뷰로 분류된 행이 없습니다."))
     return blocks
 
 
@@ -534,9 +555,17 @@ def _build_section_f(report: DashboardReport) -> list[dict[str, Any]]:
     # 3) 확인 등급 분포
     blocks.append(heading_3("확인 등급 분포 (담당별)"))
     blocks.append(
+        callout(
+            VERIFY_GRADE_WARNING_TEXT,
+            emoji="⚠️",
+            color="yellow_background",
+            bold=True,
+        )
+    )
+    blocks.append(
         paragraph(
-            "비율 분모 n = 확인됨 + 원문대조필요 + 미확인 (해당없음 제외). "
-            "앱은 등급을 '확인됨'으로 상향하지 않으며 빈 값/미분류는 '미확인'으로 표시합니다.",
+            "비율 분모 n = 확인됨 + 원문대조필요 + 미확인 + 빈 값 (해당없음 제외). "
+            "앱은 등급을 '확인됨'으로 상향하지 않으며, 확인 등급이 비어 있는 행은 '미확인'에 합치지 않고 '빈 값' 칸에 별도 집계합니다.",
             color="gray",
         )
     )
@@ -549,6 +578,7 @@ def _build_section_f(report: DashboardReport) -> list[dict[str, Any]]:
                 make_rich_text(stat.ratio_label(stat.confirmed_count)),
                 make_rich_text(stat.ratio_label(stat.needs_check_count)),
                 make_rich_text(stat.ratio_label(stat.unverified_count)),
+                make_rich_text(stat.ratio_label(stat.empty_count)),
                 make_rich_text(f"{stat.not_applicable_count}건"),
             ]
         )
@@ -560,12 +590,13 @@ def _build_section_f(report: DashboardReport) -> list[dict[str, Any]]:
             make_rich_text(tv.ratio_label(tv.confirmed_count), bold=True),
             make_rich_text(tv.ratio_label(tv.needs_check_count), bold=True),
             make_rich_text(tv.ratio_label(tv.unverified_count), bold=True),
+            make_rich_text(tv.ratio_label(tv.empty_count), bold=True),
             make_rich_text(f"{tv.not_applicable_count}건", bold=True),
         ]
     )
     blocks.append(
         table_block(
-            ["담당", "전체 (평가 n)", "확인됨", "원문대조필요", "미확인", "해당없음"],
+            ["담당", "전체 (평가 n)", "확인됨", "원문대조필요", "미확인", "빈 값", "해당없음"],
             verify_rows,
             has_row_header=True,
         )
@@ -602,6 +633,7 @@ def format_cli_summary(report: DashboardReport) -> str:
         lines.append(
             f"체험단 DB: 전체 {exp.total_count}건 | 마감임박 {len(exp.deadlines)}건(D-3 이하 {urgent}건) | "
             f"마감일 미입력 {len(exp.missing_deadlines)}건 | 현물실적 {len(exp.rewards)}건 | "
+            f"본인구매리뷰 {len(exp.self_purchase_reviews)}건 | "
             f"전체 당첨률 {exp.total_site_stats.win_rate_label()}"
         )
     else:

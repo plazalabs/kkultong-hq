@@ -152,10 +152,14 @@ def normalize_verify_grade(raw_grade: Optional[str]) -> str:
     """경쟁 기록 DB의 '확인' 등급을 정규화한다.
 
     규칙 5: 앱은 등급을 '확인됨'으로 올리지 않는다. 내리기와 표시만 한다.
+    확인 등급이 비어 있는 행은 '미확인'에 합치지 않고 '빈 값'으로 별도 분류한다.
     """
-    if raw_grade in {"확인됨", "원문대조필요", "미확인", "해당없음"}:
-        return raw_grade
-    # 비어 있거나 알 수 없는 값은 절대 '확인됨'으로 상향하지 않고 '미확인'으로 내려 표시한다.
+    if raw_grade is None or not isinstance(raw_grade, str) or not raw_grade.strip():
+        return "빈 값"
+    cleaned = raw_grade.strip()
+    if cleaned in {"확인됨", "원문대조필요", "미확인", "해당없음", "빈 값"}:
+        return cleaned
+    # 알 수 없는 비어 있지 않은 값은 절대 '확인됨'으로 상향하지 않고 '미확인'으로 내려 표시한다.
     return "미확인"
 
 

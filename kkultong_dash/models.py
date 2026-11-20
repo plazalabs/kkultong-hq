@@ -134,6 +134,7 @@ class ExperienceAnalytics:
     site_stats: list[SiteStats]
     total_site_stats: SiteStats
     rewards: list[RewardItem]
+    self_purchase_reviews: list[RewardItem] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -146,11 +147,17 @@ class OwnerVerifyStats:
     needs_check_count: int
     unverified_count: int
     not_applicable_count: int
+    empty_count: int = 0
 
     @property
     def graded_sample_size(self) -> int:
-        """비율 분모: 해당없음을 제외한 평가 대상 행 수."""
-        return self.confirmed_count + self.needs_check_count + self.unverified_count
+        """비율 분모: 해당없음을 제외한 평가 대상 행 수 (빈 값 포함)."""
+        return (
+            self.confirmed_count
+            + self.needs_check_count
+            + self.unverified_count
+            + self.empty_count
+        )
 
     def ratio_label(self, count: int) -> str:
         n = self.graded_sample_size

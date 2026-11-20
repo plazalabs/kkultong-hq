@@ -28,6 +28,24 @@ from .models import (
 from .parsers import normalize_verify_grade
 
 
+SELF_PURCHASE_CAMPAIGN_PREFIX = "쿠팡 리뷰:"
+SELF_PURCHASE_REWARD_KEYWORD = "본인 구매"
+SELF_PURCHASE_RULE_TEXT = (
+    "분류 규칙: 캠페인명이 '쿠팡 리뷰:'로 시작하거나, 제공내역에 '본인 구매' 문자열이 들어간 행은 "
+    "'본인 구매 리뷰'로 분류하여 당첨률 계산과 섹션 D(현물 실적)에서 제외하고 "
+    "별도 표 '쿠팡 리뷰 점수 작업'으로 표시합니다."
+)
+
+
+def is_self_purchase_review(row: ExperienceRow) -> bool:
+    """캠페인명이 '쿠팡 리뷰:'로 시작하거나 제공내역에 '본인 구매'가 포함되면 True."""
+    name = (row.campaign_name or "").strip()
+    reward = row.reward_text or ""
+    return name.startswith(SELF_PURCHASE_CAMPAIGN_PREFIX) or (
+        SELF_PURCHASE_REWARD_KEYWORD in reward
+    )
+
+
 def compute_experience_analytics(
     rows: list[ExperienceRow],
     *,
@@ -35,6 +53,9 @@ def compute_experience_analytics(
 ) -> ExperienceAnalytics:
     """체험단 신청·당첨 관리 DB 행 목록으로부터 섹션 B, C, D 통계를 계산한다."""
     today_kst = now_kst.astimezone(KST).date()
+
+    normal_rows = [r for r in rows if not is_self_purchase_review(r)]
+    self_purchase_rows = [r for r in rows if is_self_purchase_review(r)]
 
     # 1) 상태별 행 수
     status_counter: Counter[str] = Counter()
@@ -89,19 +110,19 @@ def compute_experience_analytics(
         )
     )
 
-    # 3) 섹션 C: 사이트별 신청·당첨 수와 당첨률
+    # 3) 섹션 C: 사이트별 신청·당첨 수와 당첨률 (본인 구매 리뷰 행 제외)
     rows_by_site: dict[str, list[ExperienceRow]] = defaultdict(list)
-    for row in rows:
+    for row in normal_rows:
         rows_by_site[row.site or "(미입력)"].append(row)
 
     site_stats: list[SiteStats] = []
     for site_name, site_rows in rows_by_site.items():
         site_stats.append(_build_site_stats(site_name, site_rows))
     site_stats.sort(key=lambda s: (-s.applied_count, -s.won_count, s.site))
-    total_site_stats = _build_site_stats("합계", rows)
+    total_site_stats = _build_site_stats("합계", normal_rows)
 
-    # 4) 섹션 D: 현물 실적 (상태: 당첨·리뷰대기·리뷰완료, 제공내역 원문 그대로)
-    reward_candidates = [r for r in rows if r.status in EXPERIENCE_WON_STATUSES]
+    # 4) 섹션 D: 현물 실적 (상태: 당첨·리뷰대기·리뷰완료, 본인 구매 리뷰 제외, 제공내역 원문 그대로)
+    reward_candidates = [r for r in normal_rows if r.status in EXPERIENCE_WON_STATUSES]
     reward_candidates.sort(
         key=lambda r: (
             -(r.review_due_date or r.announced_date or r.applied_date or date.min).toordinal(),
@@ -118,6 +139,24 @@ def compute_experience_analytics(
         for r in reward_candidates
     ]
 
+    # 5) 별도 표: 쿠팡 리뷰 점수 작업 (본인 구매 리뷰)
+    self_purchase_sorted = sorted(
+        self_purchase_rows,
+        key=lambda r: (
+            -(r.review_due_date or r.announced_date or r.applied_date or date.min).toordinal(),
+            r.campaign_name,
+        ),
+    )
+    self_purchase_reviews = [
+        RewardItem(
+            campaign_name=r.campaign_name,
+            site=r.site or "(미입력)",
+            status=r.status or "(미입력)",
+            reward_text=r.reward_text,
+        )
+        for r in self_purchase_sorted
+    ]
+
     return ExperienceAnalytics(
         total_count=len(rows),
         status_counts=ordered_statuses,
@@ -126,6 +165,7 @@ def compute_experience_analytics(
         site_stats=site_stats,
         total_site_stats=total_site_stats,
         rewards=rewards,
+        self_purchase_reviews=self_purchase_reviews,
     )
 
 
@@ -212,6 +252,7 @@ def compute_competition_analytics(
                 needs_check_count=c.get("원문대조필요", 0),
                 unverified_count=c.get("미확인", 0),
                 not_applicable_count=c.get("해당없음", 0),
+                empty_count=c.get("빈 값", 0),
             )
         )
 
@@ -222,6 +263,7 @@ def compute_competition_analytics(
         needs_check_count=total_grades.get("원문대조필요", 0),
         unverified_count=total_grades.get("미확인", 0),
         not_applicable_count=total_grades.get("해당없음", 0),
+        empty_count=total_grades.get("빈 값", 0),
     )
 
     return CompetitionAnalytics(
