@@ -247,6 +247,68 @@ class FactSeedCandidate:
     source_page_label: str = ""
 
 
+@dataclass(frozen=True)
+class AgentScoreRow:
+    """대시보드 섹션 H: 단일 에이전트의 📒 팩트 장부 기준 성적표 행 (숫자 전용, 순위·판정 없음)."""
+
+    agent: str
+    uploaded_count: Optional[int]  # 올린 팩트 수 ('올린 이' == agent)
+    maintained_count: Optional[int]  # 등급 '확인됨'으로 유지 중인 행 수
+    downgraded_count: Optional[int]  # 장부 현재 필드로 집계 가능한 내려간 행 수
+    corrected_against_count: Optional[int]  # 정정당한 수 ('올린 이' == agent, '정정한 이' 있고 != '올린 이')
+    caught_count: Optional[int]  # 잡아낸 수 ('정정한 이' == agent, '올린 이'가 다른 대상 에이전트)
+    auto_alert_count: Optional[int]  # 자동 재검증으로 등급이 내려간 행 수
+    min_sample_size: int = 5
+
+    @property
+    def is_low_sample(self) -> bool:
+        """올린 팩트 수가 기준(기본 5) 미만이면 표본 부족."""
+        return self.uploaded_count is not None and self.uploaded_count < self.min_sample_size
+
+    @property
+    def retention_denominator(self) -> Optional[int]:
+        if self.maintained_count is None or self.downgraded_count is None:
+            return None
+        return self.maintained_count + self.downgraded_count
+
+    @property
+    def retention_rate_pct(self) -> Optional[float]:
+        denom = self.retention_denominator
+        if denom is None or denom <= 0 or self.maintained_count is None:
+            return None
+        return (self.maintained_count / denom) * 100.0
+
+    def retention_label(self) -> str:
+        """유지율 칸 문자열 (숫자·집계 불가·표본 부족만 표기, 순위·판정 문구 금지)."""
+        pct = self.retention_rate_pct
+        denom = self.retention_denominator
+        if pct is None or denom is None or self.maintained_count is None:
+            if self.is_low_sample:
+                return "집계 불가 (표본 부족)"
+            return "집계 불가"
+        if self.is_low_sample:
+            return f"{pct:.1f}% ({self.maintained_count}/{denom}, 표본 부족)"
+        return f"{pct:.1f}% ({self.maintained_count}/{denom})"
+
+    @staticmethod
+    def count_label(value: Optional[int]) -> str:
+        if value is None:
+            return "집계 불가"
+        return str(value)
+
+
+@dataclass(frozen=True)
+class AgentScorecard:
+    """대시보드 섹션 H: 📒 팩트 장부 기준 에이전트 성적표 집계 결과."""
+
+    ok: bool
+    total_ledger_rows: int = 0
+    agent_rows: list[AgentScoreRow] = field(default_factory=list)
+    missing_fields: tuple[str, ...] = ()
+    is_incomplete: bool = False
+    error_message: Optional[str] = None
+
+
 @dataclass
 class DashboardReport:
     """대시보드 전체 렌더링 입력 모델."""
@@ -261,3 +323,4 @@ class DashboardReport:
     competition_analytics: Optional[CompetitionAnalytics]
     fact_alerts: list[FactAlert] = field(default_factory=list)
     settlement_summary: Optional[SettlementSummary] = None
+    agent_scorecard: Optional[AgentScorecard] = None

@@ -15,6 +15,7 @@ from .notion_client import NotionClient
 from .parsers import parse_competition_row, parse_experience_row
 from .publisher import DashboardPublisher, PublishResult
 from .renderer import format_cli_summary
+from .scorecard import load_fact_ledger_scorecard
 from .settlement import inspect_settlement_page
 
 # 종료 코드 규칙:
@@ -109,6 +110,16 @@ def run_dashboard_update(
         settlement_summary = inspect_settlement_page(notion_client, config.settlement_page_id)
         # 섹션 A 팩트 경보 로드 (P2 자동 재검증에서 기록된 경보)
         fact_alerts = local_cache.load_fact_alerts()
+        # 섹션 H 에이전트 성적표 읽기 전용 집계 (오직 📒 팩트 장부 기준; 미생성/조회 실패 시 섹션 A~G에 영향 없이 '집계 불가' 표시)
+        agent_scorecard = load_fact_ledger_scorecard(
+            notion_client,
+            local_cache,
+            parent_page_id=config.parent_page_id,
+            configured_database_id=config.fact_ledger_database_id,
+            configured_data_source_id=config.fact_ledger_data_source_id,
+            parent_page_title=config.parent_page_title,
+            db_title=config.fact_ledger_db_title,
+        )
 
         failure_reasons: list[str] = []
         if not exp_sync.ok and exp_sync.error_message:
@@ -139,6 +150,7 @@ def run_dashboard_update(
             competition_analytics=comp_analytics,
             fact_alerts=fact_alerts,
             settlement_summary=settlement_summary,
+            agent_scorecard=agent_scorecard,
         )
 
         publish_result: Optional[PublishResult] = None
@@ -174,6 +186,12 @@ def run_dashboard_update(
                 },
                 "fact_alerts_count": len(fact_alerts),
                 "settlement_structure": settlement_summary.structure_type,
+                "agent_scorecard": {
+                    "ok": agent_scorecard.ok,
+                    "total_ledger_rows": agent_scorecard.total_ledger_rows,
+                    "missing_fields": list(agent_scorecard.missing_fields),
+                    "error": agent_scorecard.error_message,
+                },
                 "warnings": report.warnings,
                 "dashboard_page_id": publish_result.dashboard_page_id if publish_result else None,
             },

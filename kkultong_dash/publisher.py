@@ -12,7 +12,7 @@
      절대 삭제하거나 다시 쓰지 않고 Notion 페이지 안에 그대로 둔다(중첩 블록·서식·이미지·표 100% 무손실).
    - 마커 바깥쪽 자동 블록만 삭제한 뒤, Notion API 2026-03-11의 position 객체로
      상단 블록(A~D + E 제목)은 position={"type": "start"} + after_block 체이닝으로 삽입하고,
-     하단 블록(F~G)은 position={"type": "end"}로 추가한다.
+     하단 블록(F~H)은 position={"type": "end"}로 추가한다.
    - 만약 사용자가 끝 마커나 두 마커를 실수로 지운 경우에도 기존 수동 입력 블록을 잃지 않도록
      복구 로직 + SQLite 로컬 백업 스냅샷을 함께 수행한다.
 """
@@ -505,11 +505,13 @@ def _find_manual_marker_indices(blocks: list[dict[str, Any]]) -> tuple[Optional[
 
 
 def _find_recovery_end_index(blocks: list[dict[str, Any]], start_idx: int) -> int:
-    """END 마커 유실 시 다음 자동 섹션(F. 경쟁 기록 요약 / G. 정산) 직전까지를 수동 구간으로 추정한다."""
+    """END 마커 유실 시 다음 자동 섹션(F. / G. / H.) 직전까지를 수동 구간으로 추정한다."""
     for idx in range(start_idx + 1, len(blocks)):
         block = blocks[idx]
         text = extract_block_plain_text(block).strip()
-        if block.get("type") == "heading_2" and (text.startswith("F.") or text.startswith("G.")):
+        if block.get("type") == "heading_2" and (
+            text.startswith("F.") or text.startswith("G.") or text.startswith("H.")
+        ):
             # 직전 블록이 divider라면 그 앞까지 보존
             if idx - 1 > start_idx and blocks[idx - 1].get("type") == "divider":
                 return idx - 2

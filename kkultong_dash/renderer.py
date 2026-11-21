@@ -253,12 +253,14 @@ def build_top_blocks(report: DashboardReport) -> list[dict[str, Any]]:
 
 
 def build_bottom_blocks(report: DashboardReport) -> list[dict[str, Any]]:
-    """보존 구간(섹션 E) 아래에 배치할 자동 생성 블록: 섹션 F, G."""
+    """보존 구간(섹션 E) 아래에 배치할 자동 생성 블록: 섹션 F, G, H."""
     blocks: list[dict[str, Any]] = []
     blocks.append(divider())
     blocks.extend(_build_section_f(report))
     blocks.append(divider())
     blocks.extend(_build_section_g(report))
+    blocks.append(divider())
+    blocks.extend(_build_section_h(report))
     return blocks
 
 
@@ -739,6 +741,81 @@ def _build_section_g(report: DashboardReport) -> list[dict[str, Any]]:
     return blocks
 
 
+def _build_section_h(report: DashboardReport) -> list[dict[str, Any]]:
+    """섹션 H: 에이전트 성적표 (📒 팩트 장부 기준).
+
+    표기 규칙:
+    - 오직 📒 팩트 장부 데이터만 사용하며 경쟁 기록 DB로 대체하지 않는다.
+    - 숫자(및 '표본 부족', '집계 불가')만 표시하고 순위·서열·우열·평가 문구를 넣지 않는다.
+    - 에이전트 행은 고정 순서(뮤즈·피클·큐·인스팅트·클실장)를 유지하며 수치 정렬하지 않는다.
+    """
+    blocks: list[dict[str, Any]] = [heading_2("H. 에이전트 성적표 (팩트 장부 기준)")]
+    sc = report.agent_scorecard
+
+    if sc is None:
+        blocks.append(
+            callout(
+                "📒 팩트 장부 데이터가 연결되지 않아 에이전트 성적표를 표시하지 않습니다. "
+                "(집계 불가 — 경쟁 기록 DB로 대체하지 않음)",
+                emoji="📒",
+                color="gray_background",
+            )
+        )
+        return blocks
+
+    if not sc.ok:
+        err = sc.error_message or "알 수 없는 오류"
+        blocks.append(
+            callout(
+                "📒 팩트 장부 조회 실패로 에이전트 성적표를 표시하지 않습니다. "
+                "(집계 불가 — 이전 숫자 및 경쟁 기록 DB 미사용)\n"
+                f"원인: {err}",
+                emoji="🚨",
+                color="red_background",
+                text_color="red",
+            )
+        )
+        return blocks
+
+    caption_lines = [
+        f"데이터 출처: 📒 팩트 장부 (전체 {sc.total_ledger_rows}건) | "
+        f"대상 에이전트: {', '.join(r.agent for r in sc.agent_rows)}",
+        "유지율 = 등급 '확인됨' 행 ÷ (유지 중 + 내려간 행) | 표본 부족: 올린 팩트 수 5 미만",
+        "내려간 행 기준(현재 필드): 등급 '불일치' 또는 (등급 '원문대조필요' 및 자동 재검증 결과 '발췌 사라짐')",
+        "자동 경보 수 기준(현재 필드): (등급 '불일치' 및 충돌 연결 있음) 또는 (등급 '원문대조필요' 및 자동 재검증 결과 '발췌 사라짐')",
+    ]
+    if sc.missing_fields:
+        caption_lines.append(
+            f"스키마 누락 필드({', '.join(sc.missing_fields)}): 해당 지표는 '집계 불가'로 표시"
+        )
+    if sc.is_incomplete:
+        caption_lines.append("참고: 팩트 장부 쿼리 10,000건 상한(request_status=incomplete) 도달")
+
+    blocks.append(paragraph("\n".join(caption_lines), color="gray"))
+
+    score_rows: list[list[list[dict[str, Any]]]] = []
+    for row in sc.agent_rows:
+        score_rows.append(
+            [
+                make_rich_text(row.agent),
+                make_rich_text(row.count_label(row.uploaded_count)),
+                make_rich_text(row.retention_label()),
+                make_rich_text(row.count_label(row.corrected_against_count)),
+                make_rich_text(row.count_label(row.caught_count)),
+                make_rich_text(row.count_label(row.auto_alert_count)),
+            ]
+        )
+
+    blocks.append(
+        table_block(
+            ["에이전트", "올린 팩트 수", "유지율", "정정당한 수", "잡아낸 수", "자동 경보 수"],
+            score_rows,
+            has_row_header=True,
+        )
+    )
+    return blocks
+
+
 def format_cli_summary(report: DashboardReport) -> str:
     """실행 결과 콘솔 요약 문자열을 생성한다 (--dry-run 및 실행 로그용)."""
     updated_str = report.updated_at_kst.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
@@ -784,4 +861,17 @@ def format_cli_summary(report: DashboardReport) -> str:
     else:
         url = report.settlement_summary.url if report.settlement_summary else DEFAULT_SETTLEMENT_PAGE_URL
         lines.append(f"정산: 수동 확인 ({url})")
+
+    if report.agent_scorecard is not None:
+        sc = report.agent_scorecard
+        if sc.ok:
+            agent_parts = ", ".join(
+                f"{r.agent}({r.count_label(r.uploaded_count)}건/{r.retention_label()})"
+                for r in sc.agent_rows
+            )
+            lines.append(f"에이전트 성적표(팩트 장부 {sc.total_ledger_rows}건): {agent_parts}")
+        else:
+            lines.append(
+                f"에이전트 성적표(팩트 장부): 집계 불가 ({sc.error_message or '조회 실패'})"
+            )
     return "\n".join(lines)

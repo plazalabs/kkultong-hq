@@ -1,10 +1,10 @@
-"""kkultong-dash P1/P2: 꿀통 대시보드 자동 갱신 및 팩트 장부 패키지."""
+"""kkultong-dash P1/P2/P3: 꿀통 대시보드 자동 갱신, 팩트 장부 및 에이전트 성적표 패키지."""
 
 from __future__ import annotations
 
 from datetime import timedelta, timezone
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # 공식 문서 확인(2026-11-20):
 # - Versioning: https://developers.notion.com/reference/versioning
@@ -91,3 +91,7 @@ SEED_TARGET_PLATFORMS = (
     "네이버 프리미엄콘텐츠",
     "Substack",
 )
+
+# P3 에이전트 성적표 (대시보드 섹션 H — 📒 팩트 장부 기준)
+SCOREBOARD_AGENTS = ("뮤즈", "피클", "큐", "인스팅트", "클실장")
+SCOREBOARD_MIN_SAMPLE_SIZE = 5
