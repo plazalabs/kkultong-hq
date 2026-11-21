@@ -26,7 +26,7 @@ from .cache import LocalCache
 from .config import normalize_notion_id
 from .fact_ledger import ensure_fact_ledger_database
 from .models import FactSeedCandidate
-from .notion_client import NotionAPIError, NotionClient
+from .notion_client import NotionAPIError, NotionClient, ReadOnlyGuardError
 from .parsers import (
     extract_block_plain_text,
     extract_page_title,
@@ -862,4 +862,179 @@ def run_fact_seed(
         created_count=created_count,
         skipped_existing_count=skipped_existing,
         summary_text="\n".join(lines),
+    )
+
+
+# ------------------------------------------------------------------
+# 기존 장부 행 근거 URL 일괄 정리 (일회성 유지보수 명령: fact-repair-urls)
+# ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UrlRepairItem:
+    """단일 팩트 장부 행의 근거 URL 정리 결과."""
+
+    page_id: str
+    claim: str
+    action: str  # "unchanged" | "repaired" | "cleared" | "empty"
+    before_url: Optional[str]
+    after_url: Optional[str]
+
+
+@dataclass(frozen=True)
+class FactUrlRepairOutcome:
+    """기존 팩트 장부 행 근거 URL 일괄 정리 실행 결과."""
+
+    database_id: str
+    data_source_id: str
+    total_rows: int
+    before_with_url_count: int
+    before_empty_url_count: int
+    after_with_url_count: int
+    after_empty_url_count: int
+    normal_count: int
+    repaired_count: int
+    cleared_count: int
+    updated_page_count: int
+    update_failed_count: int
+    items: list[UrlRepairItem]
+    summary_text: str
+    dry_run: bool = False
+
+
+def repair_fact_ledger_urls(
+    client: NotionClient,
+    cache: LocalCache,
+    *,
+    parent_page_id: Optional[str] = None,
+    configured_database_id: Optional[str] = None,
+    configured_data_source_id: Optional[str] = None,
+    parent_page_title: str = PARENT_PAGE_TITLE,
+    db_title: str = FACT_LEDGER_DB_TITLE,
+    dry_run: bool = False,
+) -> FactUrlRepairOutcome:
+    """기존 '📒 팩트 장부' 행을 순회하며 근거 URL에 sanitize_evidence_url 규칙을 일괄 적용한다.
+
+    - 고칠 수 있는 주소(한국어 조사·괄호·따옴표 등 오염)는 정제된 URL로 수정한다.
+    - 베어 도메인 등 근거가 될 수 없는 주소는 근거 URL을 비우고(None) 제거 건수로 집계한다.
+    - 등급이나 다른 속성은 변경하지 않는다.
+    """
+    init_res = ensure_fact_ledger_database(
+        client,
+        cache,
+        parent_page_id=parent_page_id,
+        configured_database_id=configured_database_id,
+        configured_data_source_id=configured_data_source_id,
+        parent_page_title=parent_page_title,
+        db_title=db_title,
+        create_if_missing=False,
+    )
+    ds_id = init_res.data_source_id
+    pages, _ = client.query_data_source(ds_id)
+    active_pages = [p for p in pages if not _is_trashed(p)]
+    rows = [parse_fact_ledger_row(p) for p in active_pages]
+
+    items: list[UrlRepairItem] = []
+    normal_count = 0
+    repaired_count = 0
+    cleared_count = 0
+    before_empty_count = 0
+    updated_count = 0
+    update_failed_count = 0
+
+    for row in rows:
+        raw_url = row.source_url
+        if not raw_url:
+            before_empty_count += 1
+            items.append(
+                UrlRepairItem(
+                    page_id=row.page_id,
+                    claim=row.claim,
+                    action="empty",
+                    before_url=None,
+                    after_url=None,
+                )
+            )
+            continue
+
+        sanitized = sanitize_evidence_url(raw_url)
+        if sanitized == raw_url:
+            normal_count += 1
+            items.append(
+                UrlRepairItem(
+                    page_id=row.page_id,
+                    claim=row.claim,
+                    action="unchanged",
+                    before_url=raw_url,
+                    after_url=raw_url,
+                )
+            )
+            continue
+
+        action = "repaired" if sanitized is not None else "cleared"
+        if action == "repaired":
+            repaired_count += 1
+        else:
+            cleared_count += 1
+
+        items.append(
+            UrlRepairItem(
+                page_id=row.page_id,
+                claim=row.claim,
+                action=action,
+                before_url=raw_url,
+                after_url=sanitized,
+            )
+        )
+
+        if not dry_run:
+            try:
+                client.update_fact_ledger_page(
+                    row.page_id,
+                    {"근거 URL": {"url": sanitized}},
+                    data_source_id=ds_id,
+                )
+                updated_count += 1
+            except ReadOnlyGuardError:
+                raise
+            except Exception:
+                update_failed_count += 1
+
+    before_with_url = normal_count + repaired_count + cleared_count
+    after_with_url = normal_count + repaired_count
+    after_empty_url = before_empty_count + cleared_count
+
+    lines = [
+        "[팩트 장부 근거 URL 정리]" + (" (dry-run)" if dry_run else ""),
+        f"대상 DB: {db_title} (data_source_id={ds_id})",
+        f"전체 행: {len(rows)}건",
+        f"실행 전: URL 있음 {before_with_url}건 | URL 비어 있음 {before_empty_count}건",
+        f"처리 내역: 정상 {normal_count}건 | 수정 {repaired_count}건 | 제거 {cleared_count}건 (원래 비어 있음 {before_empty_count}건)",
+        f"실행 후: 유효 URL {after_with_url}건 | URL 비어 있음 {after_empty_url}건",
+        f"노션 갱신: {updated_count}건 (실패 {update_failed_count}건)",
+    ]
+    for it in items:
+        if it.action == "repaired":
+            lines.append(f"  - [수정] {it.claim or it.page_id}: {it.before_url} → {it.after_url}")
+        elif it.action == "cleared":
+            lines.append(f"  - [제거] {it.claim or it.page_id}: {it.before_url} → (비움)")
+    if dry_run:
+        lines.append("[dry-run] 노션 DB 쓰기를 생략했습니다.")
+
+    return FactUrlRepairOutcome(
+        database_id=init_res.database_id,
+        data_source_id=ds_id,
+        total_rows=len(rows),
+        before_with_url_count=before_with_url,
+        before_empty_url_count=before_empty_count,
+        after_with_url_count=after_with_url,
+        after_empty_url_count=after_empty_url,
+        normal_count=normal_count,
+        repaired_count=repaired_count,
+        cleared_count=cleared_count,
+        updated_page_count=updated_count,
+        update_failed_count=update_failed_count,
+        items=items,
+        summary_text="\n".join(lines),
+        dry_run=dry_run,
     )

@@ -329,11 +329,14 @@ def _build_section_a(report: DashboardReport) -> list[dict[str, Any]]:
         )
         alert_rows: list[list[list[dict[str, Any]]]] = []
         for alert in report.fact_alerts:
-            grade_change = (
-                f"{alert.old_grade} → {alert.new_grade}"
-                if (alert.old_grade and alert.new_grade)
-                else (alert.new_grade or "-")
-            )
+            if alert.old_grade and alert.new_grade:
+                grade_change = (
+                    f"{alert.new_grade} (유지)"
+                    if alert.old_grade == alert.new_grade
+                    else f"{alert.old_grade} → {alert.new_grade}"
+                )
+            else:
+                grade_change = alert.new_grade or "-"
             url_cell = (
                 make_rich_text(alert.url, link_url=alert.url)
                 if alert.url

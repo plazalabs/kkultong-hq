@@ -22,6 +22,7 @@ from kkultong_dash.fact_ledger import (
     PoliteWebFetcher,
     RawWebResponse,
     WebFetchResult,
+    detect_fact_conflict_candidates,
     detect_fact_conflicts,
     ensure_fact_ledger_database,
     judge_revalidation,
@@ -32,6 +33,7 @@ from kkultong_dash.fact_seed import (
     DocumentUnit,
     extract_platform_seed_candidates,
     read_page_units,
+    repair_fact_ledger_urls,
     run_fact_seed,
     sanitize_evidence_url,
 )
@@ -102,6 +104,7 @@ class FakeFactNotionServer:
         excerpt: str,
         grade: str,
         conflict_ids: list[str] | None = None,
+        superseded_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         page = {
             "object": "page",
@@ -119,7 +122,7 @@ class FakeFactNotionServer:
                 "자동 재검증 시각": {"type": "date", "date": None},
                 "자동 재검증 결과": {"type": "select", "select": None},
                 "충돌": {"type": "relation", "relation": [{"id": cid} for cid in (conflict_ids or [])]},
-                "대체됨": {"type": "relation", "relation": []},
+                "대체됨": {"type": "relation", "relation": [{"id": sid} for sid in (superseded_ids or [])]},
             },
         }
         self.pages[page_id] = page
@@ -556,7 +559,7 @@ class TestFactLedgerP2(unittest.TestCase):
         self.assertEqual(d_login_wall.new_grade, "자동확인불가")
         self.assertTrue(d_login_wall.add_to_skip_list)
 
-        # 3-4) 페이지 열림 실패 -> 결과에 그대로 기록, 등급 불변
+        # 3-4) 페이지 열림 실패 -> 원인을 구분해 기록, 등급 불변
         fail_res = WebFetchResult(
             kind="open_failed",
             requested_url="https://down.example/page",
@@ -565,7 +568,7 @@ class TestFactLedgerP2(unittest.TestCase):
             detail="HTTP 503 오류",
         )
         d_fail = judge_revalidation(confirmed_row, fail_res)
-        self.assertEqual(d_fail.result, "페이지 열림 실패")
+        self.assertEqual(d_fail.result, "열림 실패 (HTTP 503)")
         self.assertEqual(d_fail.new_grade, "확인됨")
         self.assertFalse(d_fail.add_to_fact_alerts)
 
@@ -1012,7 +1015,7 @@ class TestFactLedgerP2(unittest.TestCase):
 
             p_broken = server.pages["fact-broken-non-ascii"]["properties"]
             p_valid = server.pages["fact-valid-row"]["properties"]
-            self.assertEqual(p_broken["자동 재검증 결과"]["select"]["name"], "페이지 열림 실패")
+            self.assertEqual(p_broken["자동 재검증 결과"]["select"]["name"], "열림 실패 (HTTP 404)")
             self.assertEqual(p_broken["등급"]["select"]["name"], "원문대조필요")
             self.assertEqual(p_valid["자동 재검증 결과"]["select"]["name"], "발췌 그대로")
             self.assertEqual(p_valid["등급"]["select"]["name"], "확인됨")
@@ -1076,7 +1079,7 @@ class TestFactLedgerP2(unittest.TestCase):
 
             self.assertEqual(
                 server.pages["fact-boom"]["properties"]["자동 재검증 결과"]["select"]["name"],
-                "페이지 열림 실패",
+                "열림 실패 (네트워크 오류)",
             )
             self.assertEqual(
                 server.pages["fact-ok-after-boom"]["properties"]["자동 재검증 결과"]["select"]["name"],
@@ -1174,6 +1177,469 @@ class TestFactLedgerP2(unittest.TestCase):
         # 경로가 '/'뿐인 루트 도메인 URL만 있는 수치 행은 근거 없음 + 등급 '미확인'
         self.assertIsNone(by_platform["Gumroad"].source_url)
         self.assertEqual(by_platform["Gumroad"].grade, "미확인")
+
+    # ------------------------------------------------------------------
+    # 8) P2 재작업 회귀 테스트 (수정 1~4)
+    # ------------------------------------------------------------------
+
+    def test_empty_excerpt_marks_unverifiable_and_keeps_grade_and_adds_select_option(self) -> None:
+        # (A) 순수 판정 단위 검증: 발췌가 빈 행(확인됨 / 원문대조필요) -> '확인 불가', 등급 불변, 경보 없음
+        ok_fetch = WebFetchResult(
+            kind="ok",
+            requested_url="https://help.naver.com/article/1234",
+            final_url="https://help.naver.com/article/1234",
+            status_code=200,
+            visible_text="네이버 프리미엄콘텐츠 판매 수수료 안내 페이지입니다.",
+        )
+        empty_confirmed = FactLedgerRow(
+            page_id="naver-empty-1",
+            claim="[네이버 프리미엄콘텐츠] 수수료: 10%",
+            topic_key="naver_premium.fee",
+            value="10%",
+            source_url="https://help.naver.com/article/1234",
+            excerpt="",
+            grade="확인됨",
+        )
+        empty_needs_check = FactLedgerRow(
+            page_id="naver-empty-2",
+            claim="[네이버 프리미엄콘텐츠] 정산일: 매월 15일",
+            topic_key="naver_premium.payout",
+            value="매월 15일",
+            source_url="https://help.naver.com/article/1234",
+            excerpt="   ",
+            grade="원문대조필요",
+        )
+
+        d1 = judge_revalidation(empty_confirmed, ok_fetch)
+        self.assertEqual(d1.result, "확인 불가")
+        self.assertEqual(d1.new_grade, "확인됨")
+        self.assertFalse(d1.add_to_fact_alerts)
+
+        d2 = judge_revalidation(empty_needs_check, ok_fetch)
+        self.assertEqual(d2.result, "확인 불가")
+        self.assertEqual(d2.new_grade, "원문대조필요")
+        self.assertFalse(d2.add_to_fact_alerts)
+
+        # (B) 통합 검증: 기존 DB 스키마에 '확인 불가' select 옵션이 없던 상태에서도 자동 추가 후 기록
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        fixtures = {
+            "https://help.naver.com/robots.txt": RawWebResponse(200, "https://help.naver.com/robots.txt", {}, "User-agent: *\nAllow: /\n"),
+            "https://help.naver.com/article/1234": RawWebResponse(
+                200,
+                "https://help.naver.com/article/1234",
+                {},
+                "<html><body><p>네이버 프리미엄콘텐츠 판매 수수료 안내</p></body></html>",
+            ),
+        }
+        fetcher = PoliteWebFetcher(
+            host_delay_sec=0.0,
+            transport=lambda u, h, t: fixtures[u],
+            sleep_fn=lambda _: None,
+        )
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+            # 기존 구 스키마(4개 옵션만 존재, '확인 불가' 누락) 시뮬레이션
+            server.data_sources[ds_id]["properties"]["자동 재검증 결과"] = {
+                "select": {
+                    "options": [
+                        {"name": "발췌 그대로"},
+                        {"name": "발췌 사라짐"},
+                        {"name": "페이지 열림 실패"},
+                        {"name": "로그인 필요"},
+                    ]
+                }
+            }
+            server.add_fact_row(
+                ds_id,
+                "naver-empty-row",
+                claim="[네이버 프리미엄콘텐츠] 수수료: 10%",
+                topic_key="naver_premium.fee",
+                value="10%",
+                source_url="https://help.naver.com/article/1234",
+                excerpt="",
+                grade="원문대조필요",
+            )
+
+            outcome = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+            self.assertEqual(outcome.evaluated_rows, 1)
+            self.assertEqual(outcome.failure_count, 0)
+            self.assertEqual(outcome.fact_alerts, [])
+            self.assertIn("확인 불가 1건", outcome.summary_text)
+
+            p = server.pages["naver-empty-row"]["properties"]
+            self.assertEqual(p["자동 재검증 결과"]["select"]["name"], "확인 불가")
+            self.assertEqual(p["등급"]["select"]["name"], "원문대조필요")
+
+            # 스키마에 '확인 불가' select 옵션이 추가되었는지 확인
+            schema_opts = {
+                o["name"]
+                for o in server.data_sources[ds_id]["properties"]["자동 재검증 결과"]["select"]["options"]
+            }
+            self.assertIn("확인 불가", schema_opts)
+
+    def test_open_failure_records_specific_cause_url_error_http_403_and_network_error(self) -> None:
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        def transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
+            if url.endswith("/robots.txt"):
+                return RawWebResponse(200, url, {}, "User-agent: *\nAllow: /\n")
+            if url == "https://blocked.example/article":
+                return RawWebResponse(403, url, {}, "<html><body>Access denied by WAF</body></html>")
+            if url == "https://timeout.example/article":
+                return RawWebResponse(0, url, {}, "", error="네트워크 오류: timed out")
+            return RawWebResponse(404, url, {}, "Not Found")
+
+        fetcher = PoliteWebFetcher(host_delay_sec=0.0, transport=transport, sleep_fn=lambda _: None)
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+
+            server.add_fact_row(
+                ds_id,
+                "row-broken-url",
+                claim="깨진 주소 행",
+                topic_key="test.url_error",
+                value="10%",
+                source_url="http://한글..invalid/path",
+                excerpt="10%",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "row-http-403",
+                claim="403 차단 행",
+                topic_key="test.http_403",
+                value="5%",
+                source_url="https://blocked.example/article",
+                excerpt="5%",
+                grade="확인됨",
+            )
+            server.add_fact_row(
+                ds_id,
+                "row-net-err",
+                claim="네트워크 오류 행",
+                topic_key="test.net_err",
+                value="3%",
+                source_url="https://timeout.example/article",
+                excerpt="3%",
+                grade="확인됨",
+            )
+
+            outcome = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+            self.assertEqual(outcome.evaluated_rows, 3)
+            self.assertEqual(outcome.failure_count, 3)
+            self.assertEqual(outcome.success_count, 0)
+
+            self.assertEqual(
+                server.pages["row-broken-url"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "열림 실패 (주소 오류)",
+            )
+            self.assertEqual(
+                server.pages["row-broken-url"]["properties"]["등급"]["select"]["name"],
+                "원문대조필요",
+            )
+            self.assertEqual(
+                server.pages["row-http-403"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "열림 실패 (HTTP 403)",
+            )
+            self.assertEqual(
+                server.pages["row-http-403"]["properties"]["등급"]["select"]["name"],
+                "확인됨",
+            )
+            self.assertEqual(
+                server.pages["row-net-err"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "열림 실패 (네트워크 오류)",
+            )
+            self.assertEqual(
+                server.pages["row-net-err"]["properties"]["등급"]["select"]["name"],
+                "확인됨",
+            )
+
+    def test_conflict_candidates_alert_different_values_regardless_of_grade_without_downgrading(self) -> None:
+        # (A) 순수 함수 단위 검증: 원문대조필요 쌍 -> 후보 탐지, 불일치/대체됨 행은 제외
+        row_seed_a = FactLedgerRow(
+            page_id="seed-mpp-1",
+            claim="[Medium] 멤버십: 멤버십 불필요",
+            topic_key="medium.mpp.membership_required",
+            value="멤버십 불필요",
+            source_url="https://help.medium.com/hc/en-us/articles/39121627791639",
+            excerpt="",
+            grade="원문대조필요",
+        )
+        row_seed_b = FactLedgerRow(
+            page_id="seed-mpp-2",
+            claim="[Medium] 멤버십: 월 $5 필요",
+            topic_key="medium.mpp.membership_required",
+            value="월 $5 필요",
+            source_url="https://help.medium.com/hc/en-us/articles/115011694187",
+            excerpt="",
+            grade="원문대조필요",
+        )
+        row_already_conflict = FactLedgerRow(
+            page_id="already-conflict-1",
+            claim="이미 불일치 행",
+            topic_key="already.conflict",
+            value="값 A",
+            source_url="https://example.com/a",
+            excerpt="",
+            grade="불일치",
+        )
+        row_already_conflict_peer = FactLedgerRow(
+            page_id="already-conflict-2",
+            claim="이미 불일치 상대 행",
+            topic_key="already.conflict",
+            value="값 B",
+            source_url="https://example.com/b",
+            excerpt="",
+            grade="원문대조필요",
+        )
+        row_superseded = FactLedgerRow(
+            page_id="superseded-old",
+            claim="대체된 옛 값",
+            topic_key="gumroad.fee",
+            value="8.5%",
+            source_url="https://gumroad.com/old",
+            excerpt="",
+            grade="원문대조필요",
+            superseded_ids=("superseded-new",),
+        )
+        row_current = FactLedgerRow(
+            page_id="superseded-new",
+            claim="현재 값",
+            topic_key="gumroad.fee",
+            value="10%",
+            source_url="https://gumroad.com/pricing",
+            excerpt="",
+            grade="원문대조필요",
+        )
+
+        # 둘 다 '확인됨'이 아니므로 기존 충돌 강등은 0건
+        self.assertEqual(
+            detect_fact_conflicts(
+                [row_seed_a, row_seed_b, row_already_conflict, row_already_conflict_peer, row_superseded, row_current]
+            ),
+            [],
+        )
+        candidates = detect_fact_conflict_candidates(
+            [row_seed_a, row_seed_b, row_already_conflict, row_already_conflict_peer, row_superseded, row_current]
+        )
+        self.assertEqual({c.page_id for c in candidates}, {"seed-mpp-1", "seed-mpp-2"})
+
+        # (B) 통합 검증: 재검증 실행 -> 대시보드 섹션 A '팩트 경보'에 '충돌 후보'로 표시, 등급은 '원문대조필요' 그대로
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        fixtures = {
+            "https://help.medium.com/robots.txt": RawWebResponse(200, "https://help.medium.com/robots.txt", {}, "User-agent: *\nAllow: /\n"),
+            "https://help.medium.com/hc/en-us/articles/39121627791639": RawWebResponse(200, "https://help.medium.com/hc/en-us/articles/39121627791639", {}, "<p>Partner program</p>"),
+            "https://help.medium.com/hc/en-us/articles/115011694187": RawWebResponse(200, "https://help.medium.com/hc/en-us/articles/115011694187", {}, "<p>Membership</p>"),
+        }
+        fetcher = PoliteWebFetcher(
+            host_delay_sec=0.0,
+            transport=lambda u, h, t: fixtures[u],
+            sleep_fn=lambda _: None,
+        )
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+            server.add_fact_row(
+                ds_id,
+                "seed-mpp-1",
+                claim=row_seed_a.claim,
+                topic_key=row_seed_a.topic_key,
+                value=row_seed_a.value,
+                source_url=row_seed_a.source_url,
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "seed-mpp-2",
+                claim=row_seed_b.claim,
+                topic_key=row_seed_b.topic_key,
+                value=row_seed_b.value,
+                source_url=row_seed_b.source_url,
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "superseded-old",
+                claim=row_superseded.claim,
+                topic_key=row_superseded.topic_key,
+                value=row_superseded.value,
+                source_url=None,
+                excerpt="",
+                grade="미확인",
+                superseded_ids=["superseded-new"],
+            )
+            server.add_fact_row(
+                ds_id,
+                "superseded-new",
+                claim=row_current.claim,
+                topic_key=row_current.topic_key,
+                value=row_current.value,
+                source_url=None,
+                excerpt="",
+                grade="미확인",
+            )
+
+            outcome = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+            self.assertEqual(outcome.conflicts, [])
+            self.assertEqual(len(outcome.conflict_candidates), 2)
+            self.assertEqual(len(outcome.fact_alerts), 2)
+            self.assertTrue(all("충돌 후보" in a.reason for a in outcome.fact_alerts))
+
+            # 노션 DB 등급은 '원문대조필요' 그대로 불변, 충돌 relation도 쓰이지 않음
+            self.assertEqual(server.pages["seed-mpp-1"]["properties"]["등급"]["select"]["name"], "원문대조필요")
+            self.assertEqual(server.pages["seed-mpp-2"]["properties"]["등급"]["select"]["name"], "원문대조필요")
+            self.assertEqual(server.pages["seed-mpp-1"]["properties"]["충돌"]["relation"], [])
+            self.assertEqual(server.pages["seed-mpp-2"]["properties"]["충돌"]["relation"], [])
+
+            # 대시보드 섹션 A 팩트 경보 영역 렌더링 확인
+            saved_alerts = cache.load_fact_alerts()
+            report = DashboardReport(
+                updated_at_kst=datetime(2026, 11, 21, 11, 20, 0, tzinfo=KST),
+                run_status="정상",
+                failure_reasons=[],
+                warnings=[],
+                experience_sync=SourceSyncResult("experience", "체험단 DB", True, "full", 1, 1),
+                competition_sync=SourceSyncResult("competition", "경쟁 기록 DB", True, "full", 1, 1),
+                experience_analytics=None,
+                competition_analytics=None,
+                fact_alerts=saved_alerts,
+            )
+            top_blocks = build_top_blocks(report)
+            table_blocks = [b for b in top_blocks if b.get("type") == "table"]
+            self.assertEqual(len(table_blocks), 1)
+            row_texts = [extract_block_plain_text(r) for r in table_blocks[0]["table"]["children"]]
+            joined = "\n".join(row_texts)
+            self.assertIn("충돌 후보", joined)
+            self.assertIn("원문대조필요 (유지)", joined)
+
+    def test_fact_repair_urls_sanitizes_clears_bare_domains_and_reports_counts(self) -> None:
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+
+            server.add_fact_row(
+                ds_id,
+                "url-normal",
+                claim="정상 URL 행",
+                topic_key="gumroad.fee",
+                value="10%",
+                source_url="https://gumroad.com/pricing",
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "url-broken-particle",
+                claim="조사·괄호 깨진 URL 행",
+                topic_key="medium.membership",
+                value="월 $5",
+                source_url="http://help.medium.com/hc/en-us/articles/39121627791639)는",
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "url-bare-domain",
+                claim="베어 도메인 행",
+                topic_key="medium.bare",
+                value="10%",
+                source_url="http://help.medium.com/",
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "url-empty",
+                claim="원래 URL 빈 행",
+                topic_key="substack.fee",
+                value="10%",
+                source_url=None,
+                excerpt="",
+                grade="미확인",
+            )
+
+            # 1) dry-run: 노션 PATCH 0건, 전/후 건수 정확 보고
+            dry_out = repair_fact_ledger_urls(client, cache, dry_run=True)
+            self.assertTrue(dry_out.dry_run)
+            self.assertEqual(dry_out.total_rows, 4)
+            self.assertEqual(dry_out.before_with_url_count, 3)
+            self.assertEqual(dry_out.before_empty_url_count, 1)
+            self.assertEqual(dry_out.normal_count, 1)
+            self.assertEqual(dry_out.repaired_count, 1)
+            self.assertEqual(dry_out.cleared_count, 1)
+            self.assertEqual(dry_out.after_with_url_count, 2)
+            self.assertEqual(dry_out.after_empty_url_count, 2)
+            self.assertEqual(dry_out.updated_page_count, 0)
+            self.assertEqual(server.page_update_calls, [])
+            self.assertIn("정상 1건 | 수정 1건 | 제거 1건", dry_out.summary_text)
+
+            # 2) 실제 실행: 수정·제거 대상 2건만 PATCH, 정상/빈 행은 미수정, 등급 불변
+            real_out = repair_fact_ledger_urls(client, cache, dry_run=False)
+            self.assertFalse(real_out.dry_run)
+            self.assertEqual(real_out.normal_count, 1)
+            self.assertEqual(real_out.repaired_count, 1)
+            self.assertEqual(real_out.cleared_count, 1)
+            self.assertEqual(real_out.updated_page_count, 2)
+            self.assertEqual(real_out.update_failed_count, 0)
+            self.assertEqual(
+                {pid for pid, _ in server.page_update_calls},
+                {"url-broken-particle", "url-bare-domain"},
+            )
+
+            self.assertEqual(
+                server.pages["url-normal"]["properties"]["근거 URL"]["url"],
+                "https://gumroad.com/pricing",
+            )
+            self.assertEqual(
+                server.pages["url-broken-particle"]["properties"]["근거 URL"]["url"],
+                "http://help.medium.com/hc/en-us/articles/39121627791639",
+            )
+            self.assertIsNone(server.pages["url-bare-domain"]["properties"]["근거 URL"]["url"])
+            self.assertEqual(server.pages["url-bare-domain"]["properties"]["등급"]["select"]["name"], "원문대조필요")
+            self.assertIsNone(server.pages["url-empty"]["properties"]["근거 URL"]["url"])
+
+            # 3) 재실행(멱등성): 수정 0건, 제거 0건, 정상 2건
+            server.page_update_calls.clear()
+            rerun_out = repair_fact_ledger_urls(client, cache, dry_run=False)
+            self.assertEqual(rerun_out.normal_count, 2)
+            self.assertEqual(rerun_out.repaired_count, 0)
+            self.assertEqual(rerun_out.cleared_count, 0)
+            self.assertEqual(rerun_out.updated_page_count, 0)
+            self.assertEqual(server.page_update_calls, [])
 
 
 if __name__ == "__main__":

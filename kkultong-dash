@@ -7,6 +7,7 @@
     ./kkultong-dash fact-init [--env-file PATH] [--db PATH]
     ./kkultong-dash fact-revalidate [--dry-run] [--update-dashboard] [--host-delay SEC] [--env-file PATH] [--db PATH]
     ./kkultong-dash fact-seed [--v1-page ID_OR_TITLE] [--v2-page ID_OR_TITLE] [--uploader NAME] [--dry-run] [--env-file PATH] [--db PATH]
+    ./kkultong-dash fact-repair-urls [--dry-run] [--env-file PATH] [--db PATH]
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from kkultong_dash import (
 from kkultong_dash.cache import LocalCache
 from kkultong_dash.config import AppConfig, load_dotenv
 from kkultong_dash.fact_ledger import ensure_fact_ledger_database, revalidate_fact_ledger
-from kkultong_dash.fact_seed import run_fact_seed
+from kkultong_dash.fact_seed import repair_fact_ledger_urls, run_fact_seed
 from kkultong_dash.notion_client import NotionAPIError, NotionClient, ReadOnlyGuardError
 from kkultong_dash.runner import EXIT_FAILURE, EXIT_OK, run_dashboard_update
 
@@ -155,6 +156,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="추출·변환 결과만 출력하고 노션 DB에는 쓰지 않습니다.",
     )
     _add_common_io_args(fact_seed_cmd)
+
+    fact_repair_cmd = subparsers.add_parser(
+        "fact-repair-urls",
+        help="기존 '📒 팩트 장부' 행의 근거 URL에 현재 정제(sanitize) 규칙을 일괄 적용합니다.",
+    )
+    fact_repair_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="정리 예정 건수(정상·수정·제거)만 출력하고 노션 DB에는 쓰지 않습니다.",
+    )
+    _add_common_io_args(fact_repair_cmd)
 
     return parser
 
@@ -296,6 +308,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(seed_out.summary_text, file=sys.stderr)
             return EXIT_FAILURE
         print(seed_out.summary_text)
+        return EXIT_OK
+
+    if args.command == "fact-repair-urls":
+        client = _build_client(cfg)
+        try:
+            with LocalCache(cfg.db_path) as cache:
+                repair_out = repair_fact_ledger_urls(
+                    client,
+                    cache,
+                    parent_page_id=cfg.parent_page_id,
+                    configured_database_id=cfg.fact_ledger_database_id,
+                    configured_data_source_id=cfg.fact_ledger_data_source_id,
+                    parent_page_title=cfg.parent_page_title,
+                    db_title=cfg.fact_ledger_db_title,
+                    dry_run=args.dry_run,
+                )
+        except (NotionAPIError, ReadOnlyGuardError) as exc:
+            print(f"[팩트 장부 URL 정리 실패] {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+
+        print(repair_out.summary_text)
         return EXIT_OK
 
     return EXIT_FAILURE

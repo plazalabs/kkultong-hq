@@ -176,6 +176,38 @@ def _ensure_self_relations(client: NotionClient, data_source_id: str) -> bool:
     return True
 
 
+def _ensure_revalidation_result_options(
+    client: NotionClient,
+    data_source_id: str,
+    required_options: tuple[str, ...] = FACT_LEDGER_REVALIDATION_RESULTS,
+) -> bool:
+    """'자동 재검증 결과' select 속성에 누락된 옵션('확인 불가' 등)이 있으면 기존 옵션을 보존하며 추가한다."""
+    ds = client.retrieve_data_source(data_source_id)
+    props = ds.get("properties") if isinstance(ds.get("properties"), dict) else {}
+    prop = props.get("자동 재검증 결과") if isinstance(props.get("자동 재검증 결과"), dict) else {}
+    select_obj = prop.get("select") if isinstance(prop.get("select"), dict) else {}
+    raw_options = select_obj.get("options") if isinstance(select_obj.get("options"), list) else []
+
+    existing_options: list[dict[str, Any]] = [
+        dict(opt) for opt in raw_options if isinstance(opt, dict) and opt.get("name")
+    ]
+    existing_names = {str(opt["name"]) for opt in existing_options}
+    missing_names: list[str] = []
+    for name in required_options:
+        if name and name not in existing_names and name not in missing_names:
+            missing_names.append(name)
+
+    if not missing_names:
+        return False
+
+    merged_options = [*existing_options, *[{"name": name} for name in missing_names]]
+    client.update_fact_ledger_schema(
+        data_source_id,
+        {"자동 재검증 결과": {"select": {"options": merged_options}}},
+    )
+    return True
+
+
 def ensure_fact_ledger_database(
     client: NotionClient,
     cache: LocalCache,
@@ -372,6 +404,7 @@ class WebFetchResult:
     raw_body: str = ""
     has_login_wall: bool = False
     detail: str = ""
+    failure_category: Optional[str] = None  # "url_error" | "http_error" | "network_error" | "robots_blocked"
 
 
 class _VisibleTextExtractor(HTMLParser):
@@ -641,6 +674,7 @@ class PoliteWebFetcher:
                 requested_url=url,
                 final_url=url,
                 detail=norm_err or "유효하지 않은 URL 형식",
+                failure_category="url_error",
             )
 
         parsed = urllib.parse.urlsplit(normalized_url)
@@ -654,6 +688,7 @@ class PoliteWebFetcher:
                     requested_url=url,
                     final_url=normalized_url,
                     detail="robots.txt 정책에 따라 자동 접근을 중단함",
+                    failure_category="robots_blocked",
                 )
             cd = rp.crawl_delay(self.user_agent)
             if isinstance(cd, (int, float)) and cd > 0:
@@ -672,15 +707,19 @@ class PoliteWebFetcher:
                 requested_url=url,
                 final_url=normalized_url,
                 detail=f"요청 중 예외 발생({type(exc).__name__}): {exc}",
+                failure_category="network_error",
             )
 
         if resp.error or resp.status == 0:
+            err_text = resp.error or "연결 실패"
+            category = "url_error" if err_text.startswith("URL 정규화 실패:") else "network_error"
             return WebFetchResult(
                 kind="open_failed",
                 requested_url=url,
                 final_url=resp.final_url or normalized_url,
                 status_code=resp.status or None,
-                detail=resp.error or "연결 실패",
+                detail=err_text,
+                failure_category=category,
             )
 
         final_url = resp.final_url or normalized_url
@@ -720,6 +759,7 @@ class PoliteWebFetcher:
                 final_url=final_url,
                 status_code=resp.status,
                 detail="HTTP 403 접근 거부",
+                failure_category="http_error",
             )
 
         if resp.status >= 400:
@@ -729,6 +769,7 @@ class PoliteWebFetcher:
                 final_url=final_url,
                 status_code=resp.status,
                 detail=f"HTTP {resp.status} 오류",
+                failure_category="http_error",
             )
 
         if is_login_url(normalized_url) and login_wall:
@@ -764,7 +805,7 @@ class RevalidationDecision:
     page_id: str
     old_grade: Optional[str]
     new_grade: Optional[str]
-    result: str  # "발췌 그대로" | "발췌 사라짐" | "페이지 열림 실패" | "로그인 필요"
+    result: str  # "발췌 그대로" | "발췌 사라짐" | "확인 불가" | "열림 실패 (...)" | "로그인 필요"
     add_to_fact_alerts: bool
     add_to_skip_list: bool
     detail: str = ""
@@ -782,6 +823,41 @@ class ConflictUpdate:
     old_grade: str
     new_grade: str  # "불일치"
     conflict_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConflictCandidate:
+    """등급과 무관하게 동일 주제키에 서로 다른 값이 공존하는 충돌 후보 (표시 전용, 등급 불변)."""
+
+    page_id: str
+    claim: str
+    topic_key: str
+    value: str
+    source_url: Optional[str]
+    grade: Optional[str]
+    peer_values: tuple[str, ...] = ()
+
+
+def is_open_failure_result(result: str) -> bool:
+    """자동 재검증 결과가 열림 실패 계열인지 판별한다."""
+    return result == "페이지 열림 실패" or result.startswith("열림 실패 (")
+
+
+def format_open_failure_result(fetch: Optional[WebFetchResult]) -> str:
+    """열림 실패 원인을 구분해 행에 표시할 결과 문자열로 변환한다."""
+    if fetch is None:
+        return "열림 실패 (주소 오류)"
+    if fetch.kind == "robots_blocked" or fetch.failure_category == "robots_blocked":
+        return "열림 실패 (robots.txt 차단)"
+    if fetch.failure_category == "url_error":
+        return "열림 실패 (주소 오류)"
+    if fetch.failure_category == "http_error" or (
+        fetch.status_code is not None and fetch.status_code >= 400
+    ):
+        if fetch.status_code is not None and fetch.status_code > 0:
+            return f"열림 실패 (HTTP {fetch.status_code})"
+        return "열림 실패 (HTTP 오류)"
+    return "열림 실패 (네트워크 오류)"
 
 
 def excerpt_exists_verbatim(excerpt: str, *, visible_text: str, raw_body: str = "") -> bool:
@@ -834,7 +910,7 @@ def judge_revalidation(
             page_id=row.page_id,
             old_grade=old_grade,
             new_grade=old_grade,
-            result="페이지 열림 실패",
+            result=format_open_failure_result(None),
             add_to_fact_alerts=False,
             add_to_skip_list=False,
             detail="근거 URL이 비어 있습니다.",
@@ -856,19 +932,34 @@ def judge_revalidation(
         return decision
 
     if fetch.kind in {"open_failed", "robots_blocked"}:
+        result_label = format_open_failure_result(fetch)
         decision = RevalidationDecision(
             page_id=row.page_id,
             old_grade=old_grade,
             new_grade=old_grade,
-            result="페이지 열림 실패",
+            result=result_label,
             add_to_fact_alerts=False,
             add_to_skip_list=False,
-            detail=fetch.detail or "페이지 열림 실패",
+            detail=fetch.detail or result_label,
         )
         assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
         return decision
 
     # fetch.kind == "ok"
+    # 수정 1: 원문 발췌가 비어 있으면 찾을 문장이 없으므로 '발췌 사라짐'이 아닌 '확인 불가'로 기록 (등급 불변)
+    if not (row.excerpt or "").strip():
+        decision = RevalidationDecision(
+            page_id=row.page_id,
+            old_grade=old_grade,
+            new_grade=old_grade,
+            result="확인 불가",
+            add_to_fact_alerts=False,
+            add_to_skip_list=False,
+            detail="원문 발췌가 비어 있어 자동 대조 불가",
+        )
+        assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
+        return decision
+
     if excerpt_exists_verbatim(row.excerpt, visible_text=fetch.visible_text, raw_body=fetch.raw_body):
         # 발췌 그대로: 등급 유지 (원문대조필요 -> 확인됨 상향 절대 금지!)
         decision = RevalidationDecision(
@@ -964,6 +1055,49 @@ def detect_fact_conflicts(rows: list[FactLedgerRow]) -> list[ConflictUpdate]:
     return updates
 
 
+def detect_fact_conflict_candidates(rows: list[FactLedgerRow]) -> list[ConflictCandidate]:
+    """등급과 무관하게 같은 주제키에 서로 다른 값이 공존하는 충돌 후보를 탐지한다.
+
+    - 표시 전용이며 등급을 강등하지 않는다.
+    - 이미 '불일치'로 판정됐거나 '대체됨' relation이 연결된 행은 후보에서 제외한다.
+    """
+    by_topic: dict[str, list[FactLedgerRow]] = defaultdict(list)
+    for row in rows:
+        key = row.topic_key.strip()
+        val = row.value.strip()
+        if not key or not val:
+            continue
+        if row.grade == "불일치":
+            continue
+        if row.superseded_ids:
+            continue
+        by_topic[key].append(row)
+
+    candidates: list[ConflictCandidate] = []
+    for topic_key, topic_rows in sorted(by_topic.items()):
+        if len(topic_rows) < 2:
+            continue
+        distinct_values = {r.value.strip() for r in topic_rows}
+        if len(distinct_values) < 2:
+            continue
+
+        for row in topic_rows:
+            row_val = row.value.strip()
+            peers = tuple(sorted({other.value.strip() for other in topic_rows if other.value.strip() != row_val}))
+            candidates.append(
+                ConflictCandidate(
+                    page_id=row.page_id,
+                    claim=row.claim,
+                    topic_key=topic_key,
+                    value=row.value,
+                    source_url=row.source_url,
+                    grade=row.grade,
+                    peer_values=peers,
+                )
+            )
+    return candidates
+
+
 # ------------------------------------------------------------------
 # 4) 자동 재검증 실행 오케스트레이터
 # ------------------------------------------------------------------
@@ -986,6 +1120,7 @@ class RevalidationOutcome:
     failure_count: int = 0
     row_exception_count: int = 0
     update_failed_count: int = 0
+    conflict_candidates: list[ConflictCandidate] = field(default_factory=list)
 
 
 def revalidate_fact_ledger(
@@ -1068,7 +1203,7 @@ def revalidate_fact_ledger(
                 page_id=row.page_id,
                 old_grade=row.grade,
                 new_grade=row.grade,
-                result="페이지 열림 실패",
+                result="열림 실패 (네트워크 오류)",
                 add_to_fact_alerts=False,
                 add_to_skip_list=False,
                 detail=f"행 처리 예외 격리({type(exc).__name__}): {exc}",
@@ -1096,7 +1231,7 @@ def revalidate_fact_ledger(
                 )
             )
 
-    # URL 재검증 반영 후 상태 기준으로 충돌 판정 수행
+    # URL 재검증 반영 후 상태 기준으로 충돌 판정 수행 (둘 다 '확인됨'일 때만 '불일치' 강등)
     post_rows = [
         FactLedgerRow(
             page_id=r.page_id,
@@ -1119,8 +1254,10 @@ def revalidate_fact_ledger(
     ]
     conflicts = detect_fact_conflicts(post_rows)
 
+    post_conflict_grades = dict(effective_grades)
     for cu in conflicts:
         assert_no_grade_upgrade(cu.old_grade, cu.new_grade)
+        post_conflict_grades[cu.page_id] = cu.new_grade
         props = pending_props.setdefault(cu.page_id, {})
         props["등급"] = {"select": {"name": cu.new_grade}}
         props["충돌"] = {"relation": [{"id": cid} for cid in cu.conflict_ids]}
@@ -1137,9 +1274,49 @@ def revalidate_fact_ledger(
             )
         )
 
+    # 수정 3: 등급과 무관하게 같은 주제키에 다른 값이 있으면 대시보드 '충돌 후보' 표시 (등급 불변)
+    post_conflict_rows = [
+        FactLedgerRow(
+            page_id=r.page_id,
+            claim=r.claim,
+            topic_key=r.topic_key,
+            value=r.value,
+            source_url=r.source_url,
+            excerpt=r.excerpt,
+            verified_at=r.verified_at,
+            verifier=r.verifier,
+            grade=post_conflict_grades.get(r.page_id, r.grade),
+            auto_revalidated_at=r.auto_revalidated_at,
+            auto_revalidation_result=r.auto_revalidation_result,
+            conflict_ids=r.conflict_ids,
+            superseded_ids=r.superseded_ids,
+            uploader=r.uploader,
+            corrector=r.corrector,
+        )
+        for r in rows
+    ]
+    conflict_candidates = detect_fact_conflict_candidates(post_conflict_rows)
+    for cand in conflict_candidates:
+        alerts.append(
+            FactAlert(
+                page_id=cand.page_id,
+                claim=cand.claim,
+                topic_key=cand.topic_key,
+                reason=f"충돌 후보 (값='{cand.value}')",
+                url=cand.source_url,
+                old_grade=cand.grade,
+                new_grade=cand.grade,
+                detected_at_kst=detected_at_str,
+            )
+        )
+
     updated_count = 0
     update_failed_count = 0
     if not dry_run:
+        needed_options = tuple(
+            dict.fromkeys([*FACT_LEDGER_REVALIDATION_RESULTS, *(d.result for d in decisions)])
+        )
+        _ensure_revalidation_result_options(client, ds_id, needed_options)
         for page_id, props in pending_props.items():
             try:
                 client.update_fact_ledger_page(page_id, props, data_source_id=ds_id)
@@ -1151,11 +1328,19 @@ def revalidate_fact_ledger(
         cache.replace_fact_alerts(alerts, checked_at_kst=current_kst)
 
     result_counts: dict[str, int] = defaultdict(int)
+    open_failure_breakdown: dict[str, int] = defaultdict(int)
     for d in decisions:
         result_counts[d.result] += 1
+        if is_open_failure_result(d.result):
+            open_failure_breakdown[d.result] += 1
 
-    failure_count = result_counts["페이지 열림 실패"]
+    failure_count = sum(open_failure_breakdown.values())
     success_count = len(decisions) - failure_count
+
+    open_fail_detail = ""
+    if open_failure_breakdown:
+        parts = ", ".join(f"{k} {v}건" for k, v in sorted(open_failure_breakdown.items()))
+        open_fail_detail = f"({parts})"
 
     lines = [
         f"[팩트 장부 재검증] 실행 시각: {detected_at_str}",
@@ -1165,7 +1350,8 @@ def revalidate_fact_ledger(
             "판정 요약: "
             f"발췌 그대로 {result_counts['발췌 그대로']}건 | "
             f"발췌 사라짐 {result_counts['발췌 사라짐']}건 | "
-            f"페이지 열림 실패 {result_counts['페이지 열림 실패']}건 | "
+            f"확인 불가 {result_counts['확인 불가']}건 | "
+            f"열림 실패 {failure_count}건{open_fail_detail} | "
             f"로그인 필요 {result_counts['로그인 필요']}건(목록 스킵 {skipped_login_count}건)"
         ),
         (
@@ -1173,7 +1359,11 @@ def revalidate_fact_ledger(
             f"성공 {success_count}건 | 실패 {failure_count}건 "
             f"(예외 격리 {row_exception_count}건, 노션 갱신 실패 {update_failed_count}건)"
         ),
-        f"충돌(불일치) 판정: {len(conflicts)}건 | 팩트 경보: {len(alerts)}건 | 노션 갱신: {updated_count}건",
+        (
+            f"충돌(불일치) 판정: {len(conflicts)}건 | "
+            f"충돌 후보: {len(conflict_candidates)}건 | "
+            f"팩트 경보: {len(alerts)}건 | 노션 갱신: {updated_count}건"
+        ),
     ]
     if dry_run:
         lines.append("[dry-run] 노션 DB 및 로컬 경보 쓰기를 생략했습니다.")
@@ -1194,4 +1384,5 @@ def revalidate_fact_ledger(
         failure_count=failure_count,
         row_exception_count=row_exception_count,
         update_failed_count=update_failed_count,
+        conflict_candidates=conflict_candidates,
     )
