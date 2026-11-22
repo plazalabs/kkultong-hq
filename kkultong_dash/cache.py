@@ -124,6 +124,20 @@ class LocalCache:
                     article_updated_at TEXT NOT NULL,
                     last_checked_at_kst TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS fact_grade_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at_kst TEXT NOT NULL,
+                    page_id TEXT NOT NULL,
+                    grade TEXT,
+                    auto_revalidation_result TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_fact_grade_history_run_at
+                    ON fact_grade_history (run_at_kst, page_id);
+
+                CREATE INDEX IF NOT EXISTS idx_fact_grade_history_page
+                    ON fact_grade_history (page_id, id);
                 """
             )
 
@@ -327,6 +341,53 @@ class LocalCache:
                 """,
                 (pid, source_url, updated, ts),
             )
+
+    def save_fact_grade_snapshot(
+        self,
+        rows: list[tuple[str, Optional[str], Optional[str]]],
+        *,
+        ran_at_kst: datetime,
+    ) -> int:
+        """재검증 실행 시점의 전체 행 (행 id, 등급, 자동 재검증 결과, 실행 시각)을 이력 테이블에 누적 기록한다."""
+        if not rows:
+            return 0
+        run_ts = ran_at_kst.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT INTO fact_grade_history (run_at_kst, page_id, grade, auto_revalidation_result)
+                VALUES (?, ?, ?, ?)
+                """,
+                [(run_ts, page_id, grade, reval_result) for page_id, grade, reval_result in rows],
+            )
+        return len(rows)
+
+    def load_fact_grade_history(
+        self,
+        *,
+        page_id: Optional[str] = None,
+        run_at_kst: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """저장된 팩트 장부 등급 이력 스냅샷을 조회한다 (감사·독립 검증용)."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if page_id is not None:
+            clauses.append("page_id = ?")
+            params.append(page_id)
+        if run_at_kst is not None:
+            clauses.append("run_at_kst = ?")
+            params.append(run_at_kst)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT id, page_id, grade, auto_revalidation_result, run_at_kst
+            FROM fact_grade_history
+            {where_sql}
+            ORDER BY id ASC
+            """,
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # 데이터 소스 캐시 조회/갱신

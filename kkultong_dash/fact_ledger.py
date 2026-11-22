@@ -1309,6 +1309,7 @@ class RevalidationOutcome:
     update_failed_count: int = 0
     conflict_candidates: list[ConflictCandidate] = field(default_factory=list)
     source_updated_count: int = 0
+    grade_snapshot_count: int = 0
 
 
 def revalidate_fact_ledger(
@@ -1539,6 +1540,7 @@ def revalidate_fact_ledger(
 
     updated_count = 0
     update_failed_count = 0
+    grade_snapshot_count = 0
     if not dry_run:
         needed_options = tuple(
             dict.fromkeys([*FACT_LEDGER_REVALIDATION_RESULTS, *(d.result for d in decisions)])
@@ -1553,6 +1555,19 @@ def revalidate_fact_ledger(
             except Exception:
                 update_failed_count += 1
         cache.replace_fact_alerts(alerts, checked_at_kst=current_kst)
+        # P2.5 등급 이력 스냅샷: 재검증 실행마다 전체 행(비대상 행 포함)의 최종 상태를 누적 기록
+        snapshot_rows: list[tuple[str, Optional[str], Optional[str]]] = [
+            (
+                r.page_id,
+                post_conflict_grades.get(r.page_id, r.grade),
+                effective_reval_results.get(r.page_id, r.auto_revalidation_result),
+            )
+            for r in rows
+        ]
+        grade_snapshot_count = cache.save_fact_grade_snapshot(
+            snapshot_rows,
+            ran_at_kst=current_kst,
+        )
 
     result_counts: dict[str, int] = defaultdict(int)
     open_failure_breakdown: dict[str, int] = defaultdict(int)
@@ -1590,11 +1605,12 @@ def revalidate_fact_ledger(
         (
             f"충돌(불일치) 판정: {len(conflicts)}건 | "
             f"충돌 후보: {len(conflict_candidates)}건 | "
-            f"팩트 경보: {len(alerts)}건 | 노션 갱신: {updated_count}건"
+            f"팩트 경보: {len(alerts)}건 | 노션 갱신: {updated_count}건 | "
+            f"등급 이력 스냅샷: {grade_snapshot_count}건"
         ),
     ]
     if dry_run:
-        lines.append("[dry-run] 노션 DB 및 로컬 경보 쓰기를 생략했습니다.")
+        lines.append("[dry-run] 노션 DB 및 로컬 경보·이력 스냅샷 쓰기를 생략했습니다.")
 
     return RevalidationOutcome(
         database_id=init_res.database_id,
@@ -1614,4 +1630,5 @@ def revalidate_fact_ledger(
         update_failed_count=update_failed_count,
         conflict_candidates=conflict_candidates,
         source_updated_count=source_updated_count,
+        grade_snapshot_count=grade_snapshot_count,
     )

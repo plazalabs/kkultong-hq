@@ -1966,6 +1966,126 @@ class TestFactLedgerP2(unittest.TestCase):
             self.assertIn("원문 갱신됨", saved_alerts[0].reason)
             self.assertEqual(cache.get_fact_source_updated_at("fact-med-elig"), "2026-11-22T01:00:00Z")
 
+    def test_revalidation_records_full_row_grade_history_snapshot_across_runs(self) -> None:
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        doc_text = ["<p>Fee is 8%.</p>"]
+
+        def transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
+            if url.endswith("/robots.txt"):
+                return RawWebResponse(200, url, {}, "User-agent: *\nAllow: /\n")
+            if url == "https://docs.example/fee":
+                return RawWebResponse(200, url, {}, f"<html><body>{doc_text[0]}</body></html>")
+            return RawWebResponse(404, url, {}, "Not Found")
+
+        fetcher = PoliteWebFetcher(host_delay_sec=0.0, transport=transport, sleep_fn=lambda _: None)
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+
+            # 재검증 대상 2행(확인됨, 원문대조필요) + 비대상 2행(미확인, 자동확인불가) = 전체 4행
+            server.add_fact_row(
+                ds_id,
+                "row-confirmed",
+                claim="수수료 8%",
+                topic_key="naver_premium.fee",
+                value="8%",
+                source_url="https://docs.example/fee",
+                excerpt="Fee is 8%.",
+                grade="확인됨",
+            )
+            server.add_fact_row(
+                ds_id,
+                "row-needs-check",
+                claim="발췌 빈 행",
+                topic_key="naver_premium.payment_fee",
+                value="2.4%",
+                source_url="https://docs.example/fee",
+                excerpt="",
+                grade="원문대조필요",
+            )
+            server.add_fact_row(
+                ds_id,
+                "row-unverified",
+                claim="URL 없는 미확인 행",
+                topic_key="patreon.fee",
+                value="10%",
+                source_url=None,
+                excerpt="",
+                grade="미확인",
+            )
+            p_auto = server.add_fact_row(
+                ds_id,
+                "row-auto-unverifiable",
+                claim="로그인 필요 행",
+                topic_key="private.doc",
+                value="5%",
+                source_url="https://docs.example/private",
+                excerpt="5%",
+                grade="자동확인불가",
+            )
+            p_auto["properties"]["자동 재검증 결과"] = {"type": "select", "select": {"name": "로그인 필요"}}
+
+            # dry-run은 이력 테이블에 기록하지 않음
+            dry_out = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 4, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+                dry_run=True,
+            )
+            self.assertEqual(dry_out.grade_snapshot_count, 0)
+            self.assertEqual(cache.load_fact_grade_history(), [])
+
+            # 1회차 실행: 전체 4행 스냅샷 기록
+            run1_time = datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST)
+            out1 = revalidate_fact_ledger(client, cache, now_kst=run1_time, fetcher=fetcher)
+            self.assertEqual(out1.grade_snapshot_count, 4)
+
+            hist1 = cache.load_fact_grade_history(run_at_kst="2026-11-21 05:00:00 KST")
+            self.assertEqual(len(hist1), 4)
+            by_id_1 = {h["page_id"]: h for h in hist1}
+            self.assertEqual(by_id_1["row-confirmed"]["grade"], "확인됨")
+            self.assertEqual(by_id_1["row-confirmed"]["auto_revalidation_result"], "발췌 그대로")
+            self.assertEqual(by_id_1["row-needs-check"]["grade"], "원문대조필요")
+            self.assertEqual(by_id_1["row-needs-check"]["auto_revalidation_result"], "확인 불가")
+            self.assertEqual(by_id_1["row-unverified"]["grade"], "미확인")
+            self.assertIsNone(by_id_1["row-unverified"]["auto_revalidation_result"])
+            self.assertEqual(by_id_1["row-auto-unverifiable"]["grade"], "자동확인불가")
+            self.assertEqual(by_id_1["row-auto-unverifiable"]["auto_revalidation_result"], "로그인 필요")
+
+            # 2회차 실행: 원문 변경 -> row-confirmed가 '원문대조필요' / '발췌 사라짐'으로 하향, 기존 스냅샷 보존 + 누적 8건
+            doc_text[0] = "<p>Fee changed to 9%.</p>"
+            run2_time = datetime(2026, 11, 22, 5, 0, 0, tzinfo=KST)
+            out2 = revalidate_fact_ledger(client, cache, now_kst=run2_time, fetcher=fetcher)
+            self.assertEqual(out2.grade_snapshot_count, 4)
+
+            all_hist = cache.load_fact_grade_history()
+            self.assertEqual(len(all_hist), 8)
+
+            # 행별 이력 추적 및 '자동 상향 0건' 독립 검증
+            confirmed_hist = cache.load_fact_grade_history(page_id="row-confirmed")
+            self.assertEqual(
+                [(h["run_at_kst"], h["grade"], h["auto_revalidation_result"]) for h in confirmed_hist],
+                [
+                    ("2026-11-21 05:00:00 KST", "확인됨", "발췌 그대로"),
+                    ("2026-11-22 05:00:00 KST", "원문대조필요", "발췌 사라짐"),
+                ],
+            )
+            # 어떤 행도 비-'확인됨'에서 '확인됨'으로 상향되지 않았음을 스냅샷만으로 독립 검증
+            by_page: dict[str, list[dict[str, Any]]] = {}
+            for h in all_hist:
+                by_page.setdefault(h["page_id"], []).append(h)
+            auto_upgrades = 0
+            for entries in by_page.values():
+                for prev, curr in zip(entries, entries[1:]):
+                    if prev["grade"] != "확인됨" and curr["grade"] == "확인됨":
+                        auto_upgrades += 1
+            self.assertEqual(auto_upgrades, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

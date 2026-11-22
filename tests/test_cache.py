@@ -161,6 +161,34 @@ class TestLocalCache(unittest.TestCase):
             )
             self.assertEqual(cache.get_fact_source_updated_at("p1"), "2026-11-22T01:00:00Z")
 
+            # 등급 이력 스냅샷: 2회 연속 누적 저장 및 필터 조회 검증
+            t1 = datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST)
+            t2 = datetime(2026, 11, 22, 5, 0, 0, tzinfo=KST)
+            self.assertEqual(
+                cache.save_fact_grade_snapshot(
+                    [("p1", "확인됨", "발췌 그대로"), ("p2", "미확인", None)],
+                    ran_at_kst=t1,
+                ),
+                2,
+            )
+            self.assertEqual(
+                cache.save_fact_grade_snapshot(
+                    [("p1", "원문대조필요", "발췌 사라짐"), ("p2", "미확인", None)],
+                    ran_at_kst=t2,
+                ),
+                2,
+            )
+            self.assertEqual(len(cache.load_fact_grade_history()), 4)
+            self.assertEqual(
+                len(cache.load_fact_grade_history(run_at_kst="2026-11-21 05:00:00 KST")),
+                2,
+            )
+            p1_hist = cache.load_fact_grade_history(page_id="p1")
+            self.assertEqual(
+                [(h["grade"], h["auto_revalidation_result"]) for h in p1_hist],
+                [("확인됨", "발췌 그대로"), ("원문대조필요", "발췌 사라짐")],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
