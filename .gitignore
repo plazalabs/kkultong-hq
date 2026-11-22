@@ -4,7 +4,8 @@
 !.env.example
 
 # Local SQLite cache & logs
-data/
+data/*
+!data/backfill_proposals.json
 *.db
 *.db-journal
 *.db-wal
