@@ -117,6 +117,13 @@ class LocalCache:
                     new_grade TEXT,
                     detected_at_kst TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS fact_source_doc_state (
+                    page_id TEXT PRIMARY KEY,
+                    source_url TEXT,
+                    article_updated_at TEXT NOT NULL,
+                    last_checked_at_kst TEXT NOT NULL
+                );
                 """
             )
 
@@ -278,6 +285,48 @@ class LocalCache:
             )
             for r in rows
         ]
+
+    # ------------------------------------------------------------------
+    # P2.5 원문 갱신 감시 (article.updated_at) 및 등급 이력 스냅샷
+    # ------------------------------------------------------------------
+
+    def get_fact_source_updated_at(self, page_id: str) -> Optional[str]:
+        """특정 팩트 장부 행에 대해 직전 실행에서 기록된 원문 article.updated_at을 조회한다."""
+        pid = (page_id or "").strip()
+        if not pid:
+            return None
+        row = self._conn.execute(
+            "SELECT article_updated_at FROM fact_source_doc_state WHERE page_id = ?",
+            (pid,),
+        ).fetchone()
+        return str(row["article_updated_at"]) if row else None
+
+    def save_fact_source_updated_at(
+        self,
+        page_id: str,
+        *,
+        source_url: Optional[str],
+        article_updated_at: str,
+        checked_at_kst: Optional[datetime] = None,
+    ) -> None:
+        """행별 원문 JSON의 article.updated_at 값을 로컬 DB에 저장(갱신)한다."""
+        pid = (page_id or "").strip()
+        updated = (article_updated_at or "").strip()
+        if not pid or not updated:
+            return
+        ts = (checked_at_kst or datetime.now(KST)).astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO fact_source_doc_state (page_id, source_url, article_updated_at, last_checked_at_kst)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(page_id) DO UPDATE SET
+                    source_url = COALESCE(excluded.source_url, fact_source_doc_state.source_url),
+                    article_updated_at = excluded.article_updated_at,
+                    last_checked_at_kst = excluded.last_checked_at_kst
+                """,
+                (pid, source_url, updated, ts),
+            )
 
     # ------------------------------------------------------------------
     # 데이터 소스 캐시 조회/갱신

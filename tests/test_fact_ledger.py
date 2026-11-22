@@ -19,14 +19,18 @@ from kkultong_dash import (
 )
 from kkultong_dash.cache import LocalCache
 from kkultong_dash.fact_ledger import (
+    SOURCE_UPDATED_MARKER,
+    ZENDESK_JSON_API_HOSTS,
     PoliteWebFetcher,
     RawWebResponse,
     WebFetchResult,
+    convert_to_zendesk_article_api_url,
     detect_fact_conflict_candidates,
     detect_fact_conflicts,
     ensure_fact_ledger_database,
     judge_revalidation,
     normalize_fetch_url,
+    parse_zendesk_article_json,
     revalidate_fact_ledger,
 )
 from kkultong_dash.fact_seed import (
@@ -409,19 +413,39 @@ class TestFactLedgerP2(unittest.TestCase):
         server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
         client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
 
+        api_url_new = "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json"
+        api_url_old = "https://help.medium.com/api/v2/help_center/en-us/articles/115011694187.json"
         fixtures = {
             "https://help.medium.com/robots.txt": RawWebResponse(200, "https://help.medium.com/robots.txt", {}, "User-agent: *\nAllow: /\n"),
-            url_new: RawWebResponse(
+            api_url_new: RawWebResponse(
                 200,
-                url_new,
-                {},
-                "<html><body><p>You no longer need to be a Medium member to join the Partner Program.</p></body></html>",
+                api_url_new,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "article": {
+                            "id": 39121627791639,
+                            "title": "Medium Partner Program eligibility",
+                            "updated_at": "2026-11-11T16:29:41Z",
+                            "body": "<p>You no longer need to be a Medium member to join the Partner Program.</p>",
+                        }
+                    }
+                ),
             ),
-            url_old: RawWebResponse(
+            api_url_old: RawWebResponse(
                 200,
-                url_old,
-                {},
-                "<html><body><p>To join the Partner Program, you must be a Medium member.</p></body></html>",
+                api_url_old,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "article": {
+                            "id": 115011694187,
+                            "title": "Enroll in the Medium Partner Program",
+                            "updated_at": "2026-11-11T19:31:54Z",
+                            "body": "<p>To join the Partner Program, you must be a Medium member.</p>",
+                        }
+                    }
+                ),
             ),
         }
         fetcher = PoliteWebFetcher(
@@ -1450,8 +1474,18 @@ class TestFactLedgerP2(unittest.TestCase):
 
         fixtures = {
             "https://help.medium.com/robots.txt": RawWebResponse(200, "https://help.medium.com/robots.txt", {}, "User-agent: *\nAllow: /\n"),
-            "https://help.medium.com/hc/en-us/articles/39121627791639": RawWebResponse(200, "https://help.medium.com/hc/en-us/articles/39121627791639", {}, "<p>Partner program</p>"),
-            "https://help.medium.com/hc/en-us/articles/115011694187": RawWebResponse(200, "https://help.medium.com/hc/en-us/articles/115011694187", {}, "<p>Membership</p>"),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json": RawWebResponse(
+                200,
+                "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+                {"content-type": "application/json"},
+                json.dumps({"article": {"id": 39121627791639, "body": "<p>Partner program</p>", "updated_at": "2026-11-11T16:29:41Z"}}),
+            ),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/115011694187.json": RawWebResponse(
+                200,
+                "https://help.medium.com/api/v2/help_center/en-us/articles/115011694187.json",
+                {"content-type": "application/json"},
+                json.dumps({"article": {"id": 115011694187, "body": "<p>Membership</p>", "updated_at": "2026-11-11T19:31:54Z"}}),
+            ),
         }
         fetcher = PoliteWebFetcher(
             host_delay_sec=0.0,
@@ -1640,6 +1674,297 @@ class TestFactLedgerP2(unittest.TestCase):
             self.assertEqual(rerun_out.cleared_count, 0)
             self.assertEqual(rerun_out.updated_page_count, 0)
             self.assertEqual(server.page_update_calls, [])
+
+    # ------------------------------------------------------------------
+    # 9) P2.5 작업 1 & 2 테스트: Zendesk JSON API 경로, updated_at 감시, 등급 이력 스냅샷
+    # ------------------------------------------------------------------
+
+    def test_zendesk_article_url_conversion_rules(self) -> None:
+        self.assertEqual(ZENDESK_JSON_API_HOSTS, frozenset({"help.medium.com", "support.patreon.com"}))
+
+        # help.medium.com 변환
+        self.assertEqual(
+            convert_to_zendesk_article_api_url("https://help.medium.com/hc/en-us/articles/39121627791639"),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+        )
+        self.assertEqual(
+            convert_to_zendesk_article_api_url(
+                "https://help.medium.com/hc/en-us/articles/39121627791639-Medium-Partner-Program-eligibility?foo=1#top"
+            ),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+        )
+        self.assertEqual(
+            convert_to_zendesk_article_api_url("http://help.medium.com/hc/articles/360037691372/"),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/360037691372.json",
+        )
+        self.assertEqual(
+            convert_to_zendesk_article_api_url("https://help.medium.com/hc/EN-US/articles/115011694187"),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/115011694187.json",
+        )
+        # 이미 API 형식인 URL도 그대로 정규화
+        self.assertEqual(
+            convert_to_zendesk_article_api_url(
+                "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json"
+            ),
+            "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+        )
+
+        # support.patreon.com 변환 (locale 보존 포함)
+        self.assertEqual(
+            convert_to_zendesk_article_api_url(
+                "https://support.patreon.com/hc/en-us/articles/360057086011-Submitting-a-W-8BEN"
+            ),
+            "https://support.patreon.com/api/v2/help_center/en-us/articles/360057086011.json",
+        )
+        self.assertEqual(
+            convert_to_zendesk_article_api_url(
+                "https://support.patreon.com/hc/ko/articles/360057086011"
+            ),
+            "https://support.patreon.com/api/v2/help_center/ko/articles/360057086011.json",
+        )
+
+        # 변환 대상이 아닌 경우 -> None (기존 HTML 경로 유지)
+        self.assertIsNone(
+            convert_to_zendesk_article_api_url(
+                "https://naver-premiumcontents.gitbook.io/guide/chapter2/page13"
+            )
+        )
+        self.assertIsNone(
+            convert_to_zendesk_article_api_url(
+                "https://support.other.com/hc/en-us/articles/12345"
+            )
+        )
+        self.assertIsNone(
+            convert_to_zendesk_article_api_url("https://help.medium.com/hc/en-us/categories/123")
+        )
+        self.assertIsNone(
+            convert_to_zendesk_article_api_url(
+                "http://help.medium.com/hc/en-us/articles/39121627791639)%EB%8A%94"
+            )
+        )
+
+    def test_zendesk_json_body_html_to_text_and_fetch_path_isolation(self) -> None:
+        raw_json = json.dumps(
+            {
+                "article": {
+                    "id": 360057086011,
+                    "title": "Submitting a W-8BEN",
+                    "updated_at": "2026-11-17T18:38:19Z",
+                    "body": (
+                        "<h2>Do I need to submit a W-8BEN?</h2>"
+                        "<style>.hidden { display: none; }</style>"
+                        "<p>All creators who are not US citizens must submit a W-8BEN or W-8BEN-E "
+                        "in order to pay out their funds.</p>"
+                        "<script>console.log('ignore me');</script>"
+                        "<p>US &amp; international tax info.</p>"
+                    ),
+                }
+            }
+        )
+        parsed = parse_zendesk_article_json(raw_json)
+        self.assertEqual(parsed.title, "Submitting a W-8BEN")
+        self.assertEqual(parsed.updated_at, "2026-11-17T18:38:19Z")
+        self.assertIn(
+            "All creators who are not US citizens must submit a W-8BEN or W-8BEN-E in order to pay out their funds.",
+            parsed.visible_text,
+        )
+        self.assertIn("US & international tax info.", parsed.visible_text)
+        self.assertNotIn("console.log", parsed.visible_text)
+        self.assertNotIn("display: none", parsed.visible_text)
+
+        # 잘못된 JSON 또는 article 누락 시 ValueError
+        with self.assertRaises(ValueError):
+            parse_zendesk_article_json("<html>not json</html>")
+        with self.assertRaises(ValueError):
+            parse_zendesk_article_json(json.dumps({"error": "missing"}))
+
+        # PoliteWebFetcher: Patreon 글은 JSON API로, 타 도메인은 기존 HTML 경로로 조회
+        requested: list[tuple[str, str]] = []
+        patreon_api = "https://support.patreon.com/api/v2/help_center/en-us/articles/360057086011.json"
+        naver_html = "https://naver-premiumcontents.gitbook.io/guide/chapter2/page13"
+
+        def transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
+            requested.append((url, headers.get("Accept", "")))
+            if url.endswith("/robots.txt"):
+                return RawWebResponse(200, url, {}, "User-agent: *\nAllow: /\n")
+            if url == patreon_api:
+                return RawWebResponse(200, url, {"content-type": "application/json"}, raw_json)
+            if url == naver_html:
+                return RawWebResponse(
+                    200,
+                    url,
+                    {"content-type": "text/html"},
+                    "<html><body><p>플랫폼 수수료 8%</p></body></html>",
+                )
+            return RawWebResponse(403, url, {}, "Forbidden")
+
+        fetcher = PoliteWebFetcher(host_delay_sec=0.0, transport=transport, sleep_fn=lambda _: None)
+
+        res_patreon = fetcher.fetch(
+            "https://support.patreon.com/hc/en-us/articles/360057086011-Submitting-a-W-8BEN"
+        )
+        self.assertEqual(res_patreon.kind, "ok")
+        self.assertEqual(res_patreon.fetch_mode, "zendesk_json")
+        self.assertEqual(res_patreon.final_url, patreon_api)
+        self.assertEqual(res_patreon.article_updated_at, "2026-11-17T18:38:19Z")
+        self.assertIn("must submit a W-8BEN or W-8BEN-E", res_patreon.visible_text)
+
+        res_naver = fetcher.fetch(naver_html)
+        self.assertEqual(res_naver.kind, "ok")
+        self.assertEqual(res_naver.fetch_mode, "html")
+        self.assertIsNone(res_naver.article_updated_at)
+        self.assertIn("플랫폼 수수료 8%", res_naver.visible_text)
+
+        fetched_urls = [u for u, _ in requested if not u.endswith("/robots.txt")]
+        self.assertEqual(fetched_urls, [patreon_api, naver_html])
+
+    def test_zendesk_article_updated_at_change_detection_marks_source_updated_separately(self) -> None:
+        # (A) 순수 판정 함수 단위 검증
+        row = FactLedgerRow(
+            page_id="fact-med-elig",
+            claim="Medium MPP 가입 시 활성 멤버십 필요",
+            topic_key="medium.membership",
+            value="활성 멤버십 필요",
+            source_url="https://help.medium.com/hc/en-us/articles/39121627791639",
+            excerpt="You are a Medium member with an active membership subscription.",
+            grade="확인됨",
+        )
+        fetch_v1 = WebFetchResult(
+            kind="ok",
+            requested_url=row.source_url or "",
+            final_url="https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+            status_code=200,
+            visible_text="Requirements: You are a Medium member with an active membership subscription.",
+            fetch_mode="zendesk_json",
+            article_updated_at="2026-11-11T16:29:41Z",
+        )
+        fetch_v2 = WebFetchResult(
+            kind="ok",
+            requested_url=row.source_url or "",
+            final_url="https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json",
+            status_code=200,
+            visible_text="Updated wording: You are a Medium member with an active membership subscription.",
+            fetch_mode="zendesk_json",
+            article_updated_at="2026-11-22T01:00:00Z",
+        )
+
+        # 최초 실행(직전 값 없음) -> 원문 갱신됨 미표시
+        d_first = judge_revalidation(row, fetch_v1, previous_article_updated_at=None)
+        self.assertEqual(d_first.result, "발췌 그대로")
+        self.assertFalse(d_first.source_updated)
+        self.assertIsNone(d_first.source_update_marker)
+
+        # 직전 값과 동일 -> 원문 갱신됨 미표시
+        d_same = judge_revalidation(row, fetch_v1, previous_article_updated_at="2026-11-11T16:29:41Z")
+        self.assertEqual(d_same.result, "발췌 그대로")
+        self.assertFalse(d_same.source_updated)
+        self.assertIsNone(d_same.source_update_marker)
+
+        # 직전 값과 다름 -> 자동 재검증 결과('발췌 그대로')와 별개로 '원문 갱신됨' 표시
+        d_changed = judge_revalidation(row, fetch_v2, previous_article_updated_at="2026-11-11T16:29:41Z")
+        self.assertEqual(d_changed.result, "발췌 그대로")
+        self.assertEqual(d_changed.new_grade, "확인됨")
+        self.assertTrue(d_changed.source_updated)
+        self.assertEqual(d_changed.source_update_marker, SOURCE_UPDATED_MARKER)
+        self.assertEqual(d_changed.previous_article_updated_at, "2026-11-11T16:29:41Z")
+        self.assertEqual(d_changed.current_article_updated_at, "2026-11-22T01:00:00Z")
+
+        # (B) 통합 검증: 로컬 DB에 article.updated_at 저장 후 재실행에서 변경 감지
+        server = FakeFactNotionServer()
+        server.add_page("hub-parent-1", PARENT_PAGE_TITLE)
+        client = NotionClient("secret_test", min_interval_sec=0.0, transport=server.transport)
+
+        current_updated_at = ["2026-11-11T16:29:41Z"]
+        api_url = "https://help.medium.com/api/v2/help_center/en-us/articles/39121627791639.json"
+
+        def transport(url: str, headers: dict[str, str], timeout: float) -> RawWebResponse:
+            if url.endswith("/robots.txt"):
+                return RawWebResponse(200, url, {}, "User-agent: *\nAllow: /\n")
+            if url == api_url:
+                return RawWebResponse(
+                    200,
+                    api_url,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "article": {
+                                "id": 39121627791639,
+                                "title": "Medium Partner Program eligibility",
+                                "updated_at": current_updated_at[0],
+                                "body": "<p>You are a Medium member with an active membership subscription.</p>",
+                            }
+                        }
+                    ),
+                )
+            return RawWebResponse(404, url, {}, "Not Found")
+
+        fetcher = PoliteWebFetcher(host_delay_sec=0.0, transport=transport, sleep_fn=lambda _: None)
+
+        with LocalCache(":memory:") as cache:
+            init_res = ensure_fact_ledger_database(client, cache)
+            ds_id = init_res.data_source_id
+            server.add_fact_row(
+                ds_id,
+                "fact-med-elig",
+                claim=row.claim,
+                topic_key=row.topic_key,
+                value=row.value,
+                source_url=row.source_url,
+                excerpt=row.excerpt,
+                grade="확인됨",
+            )
+
+            # 1회차: 기준 updated_at 저장, 원문 갱신됨 0건
+            out1 = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+            self.assertEqual(out1.source_updated_count, 0)
+            self.assertEqual(cache.get_fact_source_updated_at("fact-med-elig"), "2026-11-11T16:29:41Z")
+            self.assertEqual(
+                server.pages["fact-med-elig"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "발췌 그대로",
+            )
+
+            # 2회차: updated_at 변경됨 + 발췌는 그대로 -> dry-run 감지 시 로컬 DB 미덮어쓰기
+            current_updated_at[0] = "2026-11-22T01:00:00Z"
+            out_dry = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 22, 4, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+                dry_run=True,
+            )
+            self.assertEqual(out_dry.source_updated_count, 1)
+            self.assertEqual(out_dry.decisions[0].result, "발췌 그대로")
+            self.assertEqual(out_dry.decisions[0].source_update_marker, "원문 갱신됨")
+            self.assertEqual(cache.get_fact_source_updated_at("fact-med-elig"), "2026-11-11T16:29:41Z")
+
+            # 3회차(실제 실행): '발췌 그대로' 유지 + 별도로 '원문 갱신됨' 표시 + 로컬 DB 갱신
+            out2 = revalidate_fact_ledger(
+                client,
+                cache,
+                now_kst=datetime(2026, 11, 22, 5, 0, 0, tzinfo=KST),
+                fetcher=fetcher,
+            )
+            self.assertEqual(out2.source_updated_count, 1)
+            self.assertEqual(out2.decisions[0].result, "발췌 그대로")
+            self.assertEqual(out2.decisions[0].source_update_marker, "원문 갱신됨")
+            self.assertEqual(
+                server.pages["fact-med-elig"]["properties"]["자동 재검증 결과"]["select"]["name"],
+                "발췌 그대로",
+            )
+            self.assertEqual(
+                server.pages["fact-med-elig"]["properties"]["등급"]["select"]["name"],
+                "확인됨",
+            )
+            self.assertIn("원문 갱신됨 1건", out2.summary_text)
+            saved_alerts = cache.load_fact_alerts()
+            self.assertEqual(len(saved_alerts), 1)
+            self.assertIn("원문 갱신됨", saved_alerts[0].reason)
+            self.assertEqual(cache.get_fact_source_updated_at("fact-med-elig"), "2026-11-22T01:00:00Z")
 
 
 if __name__ == "__main__":

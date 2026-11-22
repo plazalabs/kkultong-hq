@@ -142,6 +142,25 @@ class TestLocalCache(unittest.TestCase):
             self.assertEqual(r2.rows_raw, [])
             self.assertIn("빈 응답", r2.error_message or "")
 
+    def test_fact_source_doc_state_and_grade_history_snapshots(self) -> None:
+        with LocalCache(":memory:") as cache:
+            self.assertIsNone(cache.get_fact_source_updated_at("p1"))
+            cache.save_fact_source_updated_at(
+                "p1",
+                source_url="https://help.medium.com/hc/en-us/articles/39121627791639",
+                article_updated_at="2026-11-11T16:29:41Z",
+                checked_at_kst=datetime(2026, 11, 21, 5, 0, 0, tzinfo=KST),
+            )
+            self.assertEqual(cache.get_fact_source_updated_at("p1"), "2026-11-11T16:29:41Z")
+
+            cache.save_fact_source_updated_at(
+                "p1",
+                source_url="https://help.medium.com/hc/en-us/articles/39121627791639",
+                article_updated_at="2026-11-22T01:00:00Z",
+                checked_at_kst=datetime(2026, 11, 22, 5, 0, 0, tzinfo=KST),
+            )
+            self.assertEqual(cache.get_fact_source_updated_at("p1"), "2026-11-22T01:00:00Z")
+
 
 if __name__ == "__main__":
     unittest.main()

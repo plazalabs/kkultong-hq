@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import http.client
+import json
 import re
 import time
 import urllib.error
@@ -44,6 +45,28 @@ from .parsers import (
 from .publisher import DashboardPublisher
 
 DEFAULT_USER_AGENT = "kkultong-hq-fact-checker/0.2 (+https://github.com/plazalabs/kkultong-hq)"
+
+# P2.5 Zendesk Help Center 공식 공개 JSON API 변환 대상 도메인 및 규칙
+# - HTML 페이지는 일부 실행 환경에서 HTTP 403을 반환하지만, 아래 두 도메인의 글(articles/<글번호>)은
+#   Zendesk 공식 공개 JSON 경로(/api/v2/help_center/<locale>/articles/<글번호>.json)로 조회 가능하다.
+# - 다른 도메인은 기존 HTML fetch 경로를 그대로 유지한다.
+ZENDESK_JSON_API_HOSTS: frozenset[str] = frozenset(
+    {
+        "help.medium.com",
+        "support.patreon.com",
+    }
+)
+ZENDESK_DEFAULT_LOCALE = "en-us"
+SOURCE_UPDATED_MARKER = "원문 갱신됨"
+
+_ZENDESK_HTML_ARTICLE_PATH_RE = re.compile(
+    r"^/hc/(?:(?P<locale>[a-z]{2}(?:-[a-z0-9]{2,4})?)/)?articles/(?P<article_id>\d+)(?:-[^/?#]*)?/?$",
+    re.IGNORECASE,
+)
+_ZENDESK_API_ARTICLE_PATH_RE = re.compile(
+    r"^/api/v2/help_center/(?:(?P<locale>[a-z]{2}(?:-[a-z0-9]{2,4})?)/)?articles/(?P<article_id>\d+)\.json$",
+    re.IGNORECASE,
+)
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _PASSWORD_INPUT_RE = re.compile(r"<input\b[^>]*\btype\s*=\s*['\"]?password['\"]?", re.IGNORECASE)
@@ -405,6 +428,51 @@ class WebFetchResult:
     has_login_wall: bool = False
     detail: str = ""
     failure_category: Optional[str] = None  # "url_error" | "http_error" | "network_error" | "robots_blocked"
+    fetch_mode: str = "html"  # "html" | "zendesk_json"
+    article_updated_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ZendeskArticlePayload:
+    """Zendesk Help Center 공개 JSON API 응답에서 추출한 글 본문 및 메타데이터."""
+
+    title: str
+    body_html: str
+    visible_text: str
+    updated_at: Optional[str] = None
+
+
+def convert_to_zendesk_article_api_url(url: str) -> Optional[str]:
+    """대상 도메인(help.medium.com, support.patreon.com)의 글 URL을 Zendesk 공개 JSON API 주소로 변환한다.
+
+    변환 규칙:
+    - 대상 호스트: ZENDESK_JSON_API_HOSTS ('help.medium.com', 'support.patreon.com')
+    - HTML 글 경로 '/hc/<locale>/articles/<글번호>[-<슬러그>]' 또는 '/hc/articles/<글번호>[-<슬러그>]'
+      -> 'https://<host>/api/v2/help_center/<locale>/articles/<글번호>.json' (locale 생략 시 'en-us')
+    - 이미 '/api/v2/help_center/<locale>/articles/<글번호>.json' 형태인 경우도 정규화된 API 주소 반환
+    - 그 외 도메인이나 비-글(article) 경로, 글번호 뒤에 비정상 꼬리가 붙은 URL은 None 반환 (기존 HTML 경로 유지)
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").lower()
+    if host not in ZENDESK_JSON_API_HOSTS:
+        return None
+
+    path = parsed.path or ""
+    match = _ZENDESK_HTML_ARTICLE_PATH_RE.match(path) or _ZENDESK_API_ARTICLE_PATH_RE.match(path)
+    if not match:
+        return None
+
+    locale = (match.group("locale") or ZENDESK_DEFAULT_LOCALE).lower()
+    article_id = match.group("article_id")
+    return f"https://{host}/api/v2/help_center/{locale}/articles/{article_id}.json"
 
 
 class _VisibleTextExtractor(HTMLParser):
@@ -452,6 +520,47 @@ def extract_visible_text(raw_body: str) -> str:
         return parser.get_text()
     except Exception:
         return html.unescape(raw_body)
+
+
+def parse_zendesk_article_json(raw_json: str) -> ZendeskArticlePayload:
+    """Zendesk Help Center JSON 응답의 article.body(HTML)를 텍스트로 변환하고 article.updated_at을 추출한다."""
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON 디코딩 오류: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("최상위 JSON 응답이 객체(dict)가 아닙니다")
+
+    article = payload.get("article")
+    if not isinstance(article, dict):
+        raise ValueError("JSON 응답에 'article' 객체가 없습니다")
+
+    raw_body = article.get("body")
+    if raw_body is None:
+        body_html = ""
+    elif isinstance(raw_body, str):
+        body_html = raw_body
+    else:
+        body_html = str(raw_body)
+
+    raw_title = article.get("title")
+    title = raw_title if isinstance(raw_title, str) else ""
+
+    raw_updated_at = article.get("updated_at")
+    updated_at = (
+        raw_updated_at.strip()
+        if isinstance(raw_updated_at, str) and raw_updated_at.strip()
+        else None
+    )
+
+    visible_text = extract_visible_text(body_html)
+    return ZendeskArticlePayload(
+        title=title,
+        body_html=body_html,
+        visible_text=visible_text,
+        updated_at=updated_at,
+    )
 
 
 def normalize_whitespace(text: str) -> str:
@@ -666,7 +775,11 @@ class PoliteWebFetcher:
         return rp
 
     def fetch(self, url: str) -> WebFetchResult:
-        """단일 근거 URL을 검증·정규화한 뒤 robots.txt와 호스트 지연을 지켜 읽기 전용으로 조회한다."""
+        """단일 근거 URL을 검증·정규화한 뒤 robots.txt와 호스트 지연을 지켜 읽기 전용으로 조회한다.
+
+        help.medium.com, support.patreon.com의 글 URL은 Zendesk 공식 공개 JSON API 주소로 변환해
+        article.body(HTML)와 article.updated_at을 추출하며, 그 외 도메인은 기존 HTML 경로를 유지한다.
+        """
         normalized_url, norm_err = normalize_fetch_url(url)
         if norm_err or not normalized_url:
             return WebFetchResult(
@@ -677,37 +790,48 @@ class PoliteWebFetcher:
                 failure_category="url_error",
             )
 
-        parsed = urllib.parse.urlsplit(normalized_url)
+        zendesk_api_url = convert_to_zendesk_article_api_url(normalized_url)
+        target_url = zendesk_api_url or normalized_url
+        fetch_mode = "zendesk_json" if zendesk_api_url else "html"
+
+        parsed = urllib.parse.urlsplit(target_url)
         host = (parsed.hostname or parsed.netloc).lower()
         rp = self._get_robots_parser(parsed.scheme, parsed.netloc)
         crawl_delay: Optional[float] = None
         if rp is not None:
-            if not rp.can_fetch(self.user_agent, normalized_url):
+            if not rp.can_fetch(self.user_agent, target_url):
                 return WebFetchResult(
                     kind="robots_blocked",
                     requested_url=url,
-                    final_url=normalized_url,
+                    final_url=target_url,
                     detail="robots.txt 정책에 따라 자동 접근을 중단함",
                     failure_category="robots_blocked",
+                    fetch_mode=fetch_mode,
                 )
             cd = rp.crawl_delay(self.user_agent)
             if isinstance(cd, (int, float)) and cd > 0:
                 crawl_delay = float(cd)
 
         self._pace_host(host, extra_crawl_delay=crawl_delay)
+        accept_header = (
+            "application/json,text/plain;q=0.8,*/*;q=0.5"
+            if fetch_mode == "zendesk_json"
+            else "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8"
+        )
         headers = {
             "User-Agent": self.user_agent,
-            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+            "Accept": accept_header,
         }
         try:
-            resp = self._transport(normalized_url, headers, self.timeout_sec)
+            resp = self._transport(target_url, headers, self.timeout_sec)
         except Exception as exc:
             return WebFetchResult(
                 kind="open_failed",
                 requested_url=url,
-                final_url=normalized_url,
+                final_url=target_url,
                 detail=f"요청 중 예외 발생({type(exc).__name__}): {exc}",
                 failure_category="network_error",
+                fetch_mode=fetch_mode,
             )
 
         if resp.error or resp.status == 0:
@@ -716,13 +840,14 @@ class PoliteWebFetcher:
             return WebFetchResult(
                 kind="open_failed",
                 requested_url=url,
-                final_url=resp.final_url or normalized_url,
+                final_url=resp.final_url or target_url,
                 status_code=resp.status or None,
                 detail=err_text,
                 failure_category=category,
+                fetch_mode=fetch_mode,
             )
 
-        final_url = resp.final_url or normalized_url
+        final_url = resp.final_url or target_url
         visible = extract_visible_text(resp.body)
         login_wall = has_login_wall_signal(resp.body, visible)
 
@@ -733,15 +858,17 @@ class PoliteWebFetcher:
                 final_url=final_url,
                 status_code=resp.status,
                 detail="HTTP 401 인증 필요",
+                fetch_mode=fetch_mode,
             )
 
-        if final_url != normalized_url and is_login_url(final_url):
+        if final_url != target_url and is_login_url(final_url):
             return WebFetchResult(
                 kind="login_required",
                 requested_url=url,
                 final_url=final_url,
                 status_code=resp.status,
                 detail=f"로그인 페이지로 리다이렉트됨 ({final_url})",
+                fetch_mode=fetch_mode,
             )
 
         if resp.status == 403:
@@ -752,6 +879,7 @@ class PoliteWebFetcher:
                     final_url=final_url,
                     status_code=resp.status,
                     detail="HTTP 403 로그인/인증 필요",
+                    fetch_mode=fetch_mode,
                 )
             return WebFetchResult(
                 kind="open_failed",
@@ -760,6 +888,7 @@ class PoliteWebFetcher:
                 status_code=resp.status,
                 detail="HTTP 403 접근 거부",
                 failure_category="http_error",
+                fetch_mode=fetch_mode,
             )
 
         if resp.status >= 400:
@@ -770,15 +899,44 @@ class PoliteWebFetcher:
                 status_code=resp.status,
                 detail=f"HTTP {resp.status} 오류",
                 failure_category="http_error",
+                fetch_mode=fetch_mode,
             )
 
-        if is_login_url(normalized_url) and login_wall:
+        if is_login_url(target_url) and login_wall:
             return WebFetchResult(
                 kind="login_required",
                 requested_url=url,
                 final_url=final_url,
                 status_code=resp.status,
                 detail="로그인 전용 URL",
+                fetch_mode=fetch_mode,
+            )
+
+        if fetch_mode == "zendesk_json":
+            try:
+                article = parse_zendesk_article_json(resp.body)
+            except ValueError as exc:
+                return WebFetchResult(
+                    kind="open_failed",
+                    requested_url=url,
+                    final_url=final_url,
+                    status_code=resp.status,
+                    detail=f"Zendesk JSON 응답 파싱 실패: {exc}",
+                    failure_category="network_error",
+                    fetch_mode=fetch_mode,
+                )
+            article_login_wall = has_login_wall_signal(article.body_html, article.visible_text)
+            return WebFetchResult(
+                kind="ok",
+                requested_url=url,
+                final_url=final_url,
+                status_code=resp.status,
+                visible_text=article.visible_text,
+                raw_body=article.body_html,
+                has_login_wall=article_login_wall,
+                detail="OK (Zendesk JSON API)",
+                fetch_mode=fetch_mode,
+                article_updated_at=article.updated_at,
             )
 
         return WebFetchResult(
@@ -790,6 +948,7 @@ class PoliteWebFetcher:
             raw_body=resp.body,
             has_login_wall=login_wall,
             detail="OK",
+            fetch_mode=fetch_mode,
         )
 
 
@@ -809,6 +968,10 @@ class RevalidationDecision:
     add_to_fact_alerts: bool
     add_to_skip_list: bool
     detail: str = ""
+    source_updated: bool = False
+    source_update_marker: Optional[str] = None  # 갱신 감지 시 "원문 갱신됨" (자동 재검증 결과와 별개)
+    previous_article_updated_at: Optional[str] = None
+    current_article_updated_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -888,6 +1051,7 @@ def judge_revalidation(
     fetch: Optional[WebFetchResult],
     *,
     already_in_skip_list: bool = False,
+    previous_article_updated_at: Optional[str] = None,
 ) -> RevalidationDecision:
     """단일 팩트 장부 행과 웹 조회 결과로부터 재검증 결과 및 등급 변동을 판정한다."""
     old_grade = row.grade
@@ -946,6 +1110,13 @@ def judge_revalidation(
         return decision
 
     # fetch.kind == "ok"
+    # P2.5 문서 갱신 감시: JSON 응답의 article.updated_at이 직전 실행 값과 다르면
+    # 자동 재검증 결과('발췌 그대로'/'발췌 사라짐'/'확인 불가' 등)와 별개로 '원문 갱신됨' 표시를 남긴다.
+    prev_updated = (previous_article_updated_at or "").strip() or None
+    curr_updated = (fetch.article_updated_at or "").strip() or None
+    source_updated = bool(prev_updated and curr_updated and prev_updated != curr_updated)
+    source_update_marker = SOURCE_UPDATED_MARKER if source_updated else None
+
     # 수정 1: 원문 발췌가 비어 있으면 찾을 문장이 없으므로 '발췌 사라짐'이 아닌 '확인 불가'로 기록 (등급 불변)
     if not (row.excerpt or "").strip():
         decision = RevalidationDecision(
@@ -956,6 +1127,10 @@ def judge_revalidation(
             add_to_fact_alerts=False,
             add_to_skip_list=False,
             detail="원문 발췌가 비어 있어 자동 대조 불가",
+            source_updated=source_updated,
+            source_update_marker=source_update_marker,
+            previous_article_updated_at=prev_updated,
+            current_article_updated_at=curr_updated,
         )
         assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
         return decision
@@ -970,6 +1145,10 @@ def judge_revalidation(
             add_to_fact_alerts=False,
             add_to_skip_list=False,
             detail="원문 발췌 일치",
+            source_updated=source_updated,
+            source_update_marker=source_update_marker,
+            previous_article_updated_at=prev_updated,
+            current_article_updated_at=curr_updated,
         )
         assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
         return decision
@@ -984,6 +1163,10 @@ def judge_revalidation(
             add_to_fact_alerts=False,
             add_to_skip_list=True,
             detail="본문에 로그인 벽 감지 — 우회 금지 및 재시도 제외",
+            source_updated=source_updated,
+            source_update_marker=source_update_marker,
+            previous_article_updated_at=prev_updated,
+            current_article_updated_at=curr_updated,
         )
         assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
         return decision
@@ -1004,6 +1187,10 @@ def judge_revalidation(
         add_to_fact_alerts=alert,
         add_to_skip_list=False,
         detail="페이지 본문에서 원문 발췌를 찾을 수 없음",
+        source_updated=source_updated,
+        source_update_marker=source_update_marker,
+        previous_article_updated_at=prev_updated,
+        current_article_updated_at=curr_updated,
     )
     assert_no_grade_upgrade(decision.old_grade, decision.new_grade)
     return decision
@@ -1121,6 +1308,7 @@ class RevalidationOutcome:
     row_exception_count: int = 0
     update_failed_count: int = 0
     conflict_candidates: list[ConflictCandidate] = field(default_factory=list)
+    source_updated_count: int = 0
 
 
 def revalidate_fact_ledger(
@@ -1162,9 +1350,13 @@ def revalidate_fact_ledger(
     decisions: list[RevalidationDecision] = []
     pending_props: dict[str, dict[str, Any]] = {}
     effective_grades: dict[str, Optional[str]] = {r.page_id: r.grade for r in rows}
+    effective_reval_results: dict[str, Optional[str]] = {
+        r.page_id: r.auto_revalidation_result for r in rows
+    }
     alerts: list[FactAlert] = []
     skipped_login_count = 0
     row_exception_count = 0
+    source_updated_count = 0
 
     for row in rows:
         if row.grade not in FACT_LEDGER_REVALIDATE_TARGET_GRADES:
@@ -1177,8 +1369,20 @@ def revalidate_fact_ledger(
                 skipped_login_count += 1
                 decision = judge_revalidation(row, None, already_in_skip_list=True)
             else:
+                prev_updated_at = cache.get_fact_source_updated_at(row.page_id)
                 fetch_res = web_fetcher.fetch(row.source_url)
-                decision = judge_revalidation(row, fetch_res)
+                decision = judge_revalidation(
+                    row,
+                    fetch_res,
+                    previous_article_updated_at=prev_updated_at,
+                )
+                if fetch_res.kind == "ok" and fetch_res.article_updated_at and not dry_run:
+                    cache.save_fact_source_updated_at(
+                        row.page_id,
+                        source_url=row.source_url,
+                        article_updated_at=fetch_res.article_updated_at,
+                        checked_at_kst=current_kst,
+                    )
 
             if decision.add_to_skip_list and row.source_url and not dry_run:
                 cache.add_url_to_skip_list(
@@ -1215,6 +1419,7 @@ def revalidate_fact_ledger(
 
         decisions.append(decision)
         effective_grades[row.page_id] = decision.new_grade
+        effective_reval_results[row.page_id] = decision.result
         pending_props[row.page_id] = props
 
         if decision.add_to_fact_alerts:
@@ -1224,6 +1429,24 @@ def revalidate_fact_ledger(
                     claim=row.claim,
                     topic_key=row.topic_key,
                     reason="발췌 사라짐 (원문 재대조 필요)",
+                    url=row.source_url,
+                    old_grade=decision.old_grade,
+                    new_grade=decision.new_grade,
+                    detected_at_kst=detected_at_str,
+                )
+            )
+
+        if decision.source_updated:
+            source_updated_count += 1
+            alerts.append(
+                FactAlert(
+                    page_id=row.page_id,
+                    claim=row.claim,
+                    topic_key=row.topic_key,
+                    reason=(
+                        f"{SOURCE_UPDATED_MARKER} "
+                        f"({decision.previous_article_updated_at} → {decision.current_article_updated_at})"
+                    ),
                     url=row.source_url,
                     old_grade=decision.old_grade,
                     new_grade=decision.new_grade,
@@ -1244,7 +1467,9 @@ def revalidate_fact_ledger(
             verifier=r.verifier,
             grade=effective_grades.get(r.page_id, r.grade),
             auto_revalidated_at=r.auto_revalidated_at,
-            auto_revalidation_result=r.auto_revalidation_result,
+            auto_revalidation_result=effective_reval_results.get(
+                r.page_id, r.auto_revalidation_result
+            ),
             conflict_ids=r.conflict_ids,
             superseded_ids=r.superseded_ids,
             uploader=r.uploader,
@@ -1287,7 +1512,9 @@ def revalidate_fact_ledger(
             verifier=r.verifier,
             grade=post_conflict_grades.get(r.page_id, r.grade),
             auto_revalidated_at=r.auto_revalidated_at,
-            auto_revalidation_result=r.auto_revalidation_result,
+            auto_revalidation_result=effective_reval_results.get(
+                r.page_id, r.auto_revalidation_result
+            ),
             conflict_ids=r.conflict_ids,
             superseded_ids=r.superseded_ids,
             uploader=r.uploader,
@@ -1357,7 +1584,8 @@ def revalidate_fact_ledger(
         (
             "행 처리 요약: "
             f"성공 {success_count}건 | 실패 {failure_count}건 "
-            f"(예외 격리 {row_exception_count}건, 노션 갱신 실패 {update_failed_count}건)"
+            f"(예외 격리 {row_exception_count}건, 노션 갱신 실패 {update_failed_count}건) | "
+            f"{SOURCE_UPDATED_MARKER} {source_updated_count}건"
         ),
         (
             f"충돌(불일치) 판정: {len(conflicts)}건 | "
@@ -1385,4 +1613,5 @@ def revalidate_fact_ledger(
         row_exception_count=row_exception_count,
         update_failed_count=update_failed_count,
         conflict_candidates=conflict_candidates,
+        source_updated_count=source_updated_count,
     )
