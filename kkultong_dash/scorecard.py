@@ -4,11 +4,11 @@
 1. 데이터 출처는 오직 '📒 팩트 장부'뿐이다. 경쟁 기록 DB의 자기 신고 등급은 일절 사용하지 않는다.
 2. 대상 에이전트는 5명('뮤즈', '피클', '큐', '인스팅트', '클실장') 고정 순서로 집계하며,
    점수·건수 기준 정렬(순위·서열화)이나 우열·판정 문구를 생성하지 않는다.
-3. '내려간 행'과 '자동 경보 수'는 팩트 장부의 현재 필드(등급, 자동 재검증 결과, 충돌)로
+3. '내려간 행'과 '자동 경보 수'는 팩트 장부의 현재 필드(등급, 자동 재검증 결과, 충돌, 대체됨)로
    객관적으로 셀 수 있는 범위에서만 정의하며, 추측으로 과거 이력을 추정하지 않는다.
 4. 분모가 0이거나 필수 스키마 필드가 누락되었거나 장부 조회에 실패한 경우 해당 지표를
    '집계 불가'로 표시한다.
-5. 올린 팩트 수가 5 미만인 에이전트는 유지율 칸에 '표본 부족'을 병기한다.
+5. 유지율의 분모(유지 중 + 내려간 행)가 5 미만인 에이전트는 유지율 칸에 '표본 부족'을 병기한다.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from . import (
     FACT_LEDGER_DB_TITLE,
     PARENT_PAGE_TITLE,
     SCOREBOARD_AGENTS,
+    SCOREBOARD_CHAIRMAN_ACTOR,
     SCOREBOARD_MIN_SAMPLE_SIZE,
 )
 from .cache import LocalCache
@@ -29,9 +30,10 @@ from .notion_client import NotionAPIError, NotionClient, ReadOnlyGuardError
 from .parsers import parse_fact_ledger_row
 
 # 지표별 필수 팩트 장부 속성 정의 (누락 시 추측하지 않고 '집계 불가' 처리)
+# P2.5 변경: '대체됨' 관계만 있는 행도 내려간 행에 포함하므로 retention 필수 필드에 '대체됨'을 포함한다.
 FACT_LEDGER_SCOREBOARD_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "uploaded": ("올린 이",),
-    "retention": ("올린 이", "등급", "자동 재검증 결과"),
+    "retention": ("올린 이", "등급", "자동 재검증 결과", "대체됨"),
     "corrected_against": ("올린 이", "정정한 이"),
     "caught": ("올린 이", "정정한 이"),
     "auto_alert": ("올린 이", "등급", "자동 재검증 결과", "충돌"),
@@ -45,31 +47,34 @@ def _is_trashed(obj: dict[str, Any]) -> bool:
 def is_fact_row_downgraded(row: FactLedgerRow) -> bool:
     """장부의 현재 필드만으로 셀 수 있는 '내려간 행' 여부를 판별한다.
 
-    집계 기준 (현재 14개 필드 범위 내, 추측 없음):
+    집계 기준 (P2.5 확정 판정 반영, 현재 14개 필드 범위 내):
     1. 등급 == '불일치':
        P2 충돌 탐지(detect_fact_conflicts)는 '확인됨' 상태의 행만 '불일치'로 내리며,
        수동으로 '불일치'가 부여된 행도 확인 유지에서 탈락한 충돌 행으로 집계한다.
     2. 등급 == '원문대조필요' 이고 자동 재검증 결과 == '발췌 사라짐':
        P2 자동 재검증(judge_revalidation)이 '확인됨' 행에서 원문 발췌 소실을 감지하면
        등급을 '원문대조필요'로 내리고 자동 재검증 결과를 '발췌 사라짐'으로 기록한다.
+    3. '대체됨' relation이 1건 이상 연결된 행 (등급 '자동확인불가' 제외):
+       P2.5 변경 근거 — 정본 정리·정정 과정에서 다른 행으로 대체된 사실은 더 이상 유지 중인
+       정본이 아니므로, '대체됨' 관계만 연결된 행도 내려간 행에 포함한다.
 
-    제외 및 경계 (추측 금지):
+    제외 및 경계:
     - 등급 '자동확인불가'(자동 재검증 결과 '로그인 필요')는 외부 로그인 장벽으로 인한
       자동 검증 불가 상태이며 P2에서도 팩트 경보 대상(add_to_fact_alerts=False)이 아니므로
-      내려간 행에서 제외한다.
-    - 등급 '미확인' 또는 '원문대조필요'(발췌 사라짐 외: 미검증, 발췌 그대로, 확인 불가, 열림 실패)는
-      초기 대기 행과 수동 하향을 현재 필드만으로 구분할 수 없어 포함하지 않는다.
-    - '대체됨' relation만 연결된 비-'확인됨' 행은 과거 '확인됨' 여부를 현재 필드로 확인할 수 없어
-      제외한다.
-    - 장부에 '이전 등급' 이력 필드가 없으므로, 애초에 '원문대조필요'에 원문 발췌가 채워져 있던
-      행이 '발췌 사라짐'을 받은 경우와 '확인됨'→'원문대조필요' 하향은 현재 필드만으로
-      완전 구분할 수 없다(단, fact-seed 생성 행은 발췌가 비어 있어 '확인 불가'로 기록됨).
+      기존대로 내려간 행에서 제외한다.
+    - '대체됨'이 비어 있고 등급이 '미확인' 또는 '원문대조필요'(발췌 사라짐 외: 미검증,
+      발췌 그대로, 확인 불가, 열림 실패)인 행은 초기 대기 행과 수동 하향을 현재 필드만으로
+      구분할 수 없어 포함하지 않는다.
     """
     grade = (row.grade or "").strip()
     reval_result = (row.auto_revalidation_result or "").strip()
+    if grade == "자동확인불가":
+        return False
     if grade == "불일치":
         return True
     if grade == "원문대조필요" and reval_result == "발췌 사라짐":
+        return True
+    if len(row.superseded_ids) > 0:
         return True
     return False
 
@@ -88,8 +93,7 @@ def is_fact_row_auto_alert_downgraded(row: FactLedgerRow) -> bool:
     - 현재 등급이 '확인됨'인 행은 과거 자동 재검증 결과 문자열이 남아 있더라도 제외한다.
     - 등급 '불일치'이나 '충돌' relation이 비어 있는 행은 자동 충돌 강등 여부를 확인할 수 없어
       자동 경보 수에서 제외한다(유지율의 내려간 행에는 포함).
-    - '이전 등급' 이력 필드가 없어, 처음부터 '원문대조필요'였던 행이 '발췌 사라짐'을 받은 경우와
-      '확인됨'→'원문대조필요' 자동 강등을 현재 필드만으로 완전 구분할 수는 없다.
+    - '대체됨' relation은 수동 정리·대체 표시이므로 자동 경보 수에는 포함하지 않는다.
     """
     grade = (row.grade or "").strip()
     reval_result = (row.auto_revalidation_result or "").strip()
@@ -110,13 +114,16 @@ def compute_agent_scorecard(
 ) -> AgentScorecard:
     """📒 팩트 장부 행 목록으로부터 섹션 H 에이전트 성적표를 집계한다.
 
-    지표 정의:
+    지표 정의 (P2.5 확정 판정 3건 반영):
     - 올린 팩트 수: '올린 이'가 그 에이전트인 행 수
-    - 유지율: 그 에이전트가 올린 행 중 등급 '확인됨' 유지 중 ÷ (유지 중 + 내려간 행)
-      (분모가 0이거나 필수 필드 누락 시 '집계 불가', 올린 팩트 수 < 5이면 '표본 부족' 병기)
+    - 유지율: 그 에이전트가 올린 행 중 등급 '확인됨' 유지 중('대체됨' 미연결) ÷ (유지 중 + 내려간 행)
+      (분모가 0이거나 필수 필드 누락 시 '집계 불가',
+       유지율 분모(유지 중 + 내려간 행) < 5이면 유지율 옆에 '표본 부족' 병기)
     - 정정당한 수: 그 에이전트가 올린 행 중 '정정한 이'가 있고 '올린 이'와 다른 행 수
-    - 잡아낸 수: '정정한 이'가 그 에이전트이고 '올린 이'가 다른 대상 에이전트인 행 수
-      ('올린 이'가 비어 있거나 본인 정정인 경우 제외, '회장님' 등 대상 외 '올린 이' 제외)
+    - 잡아낸 수: '정정한 이'가 그 에이전트이고 '올린 이'가 다른 대상 에이전트 또는 '회장님'인 행 수
+      (P2.5 변경 근거: '회장님'이 올린 행의 오류를 에이전트가 정정한 기여도 포함하되,
+       타 에이전트 정정과 혼동되지 않도록 대시보드에서 괄호로 분리 표기 — 예: '3 (회장님 행 1)'.
+       '올린 이' 미입력, 본인 정정, 대상 외 타인은 제외)
     - 자동 경보 수: 그 에이전트가 올린 행 중 자동 재검증으로 등급이 내려간 행 수
       (필수 필드 누락 시 '집계 불가')
     """
@@ -137,7 +144,7 @@ def compute_agent_scorecard(
 
     missing_fields: list[str] = []
     if props_set is not None:
-        all_required = ("올린 이", "정정한 이", "등급", "자동 재검증 결과", "충돌")
+        all_required = ("올린 이", "정정한 이", "등급", "자동 재검증 결과", "충돌", "대체됨")
         missing_fields = [f for f in all_required if f not in props_set]
 
     agent_set = set(agents)
@@ -146,6 +153,7 @@ def compute_agent_scorecard(
     downgraded_counts: dict[str, int] = {a: 0 for a in agents}
     corrected_against_counts: dict[str, int] = {a: 0 for a in agents}
     caught_counts: dict[str, int] = {a: 0 for a in agents}
+    caught_chairman_counts: dict[str, int] = {a: 0 for a in agents}
     auto_alert_counts: dict[str, int] = {a: 0 for a in agents}
 
     for row in rows:
@@ -155,10 +163,11 @@ def compute_agent_scorecard(
 
         if uploader in agent_set:
             uploaded_counts[uploader] += 1
-            if grade == "확인됨":
-                maintained_counts[uploader] += 1
-            elif is_fact_row_downgraded(row):
+            # '대체됨'이 연결된 행은 등급이 아직 '확인됨'으로 남아 있더라도 유지 중이 아니라 내려간 행으로 집계
+            if is_fact_row_downgraded(row):
                 downgraded_counts[uploader] += 1
+            elif grade == "확인됨":
+                maintained_counts[uploader] += 1
 
             if corrector is not None and corrector != uploader:
                 corrected_against_counts[uploader] += 1
@@ -166,8 +175,12 @@ def compute_agent_scorecard(
             if is_fact_row_auto_alert_downgraded(row):
                 auto_alert_counts[uploader] += 1
 
-        if corrector in agent_set and uploader in agent_set and uploader != corrector:
-            caught_counts[corrector] += 1
+        if corrector in agent_set and uploader is not None and uploader != corrector:
+            if uploader in agent_set:
+                caught_counts[corrector] += 1
+            elif uploader == SCOREBOARD_CHAIRMAN_ACTOR:
+                caught_counts[corrector] += 1
+                caught_chairman_counts[corrector] += 1
 
     # 대상 에이전트 고정 순서 유지 (순위·서열 정렬 금지)
     agent_rows: list[AgentScoreRow] = [
@@ -180,6 +193,7 @@ def compute_agent_scorecard(
             caught_count=caught_counts[agent] if can_caught else None,
             auto_alert_count=auto_alert_counts[agent] if can_auto_alert else None,
             min_sample_size=min_sample_size,
+            caught_chairman_count=caught_chairman_counts[agent] if can_caught else None,
         )
         for agent in agents
     ]

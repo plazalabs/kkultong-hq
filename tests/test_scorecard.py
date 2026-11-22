@@ -92,6 +92,7 @@ class TestAgentScorecardP3(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_uploader_and_corrector_combinations(self) -> None:
+        # 비대상자('회장님')가 올린 행을 에이전트(큐)가 정정 -> P2.5 정의 변경: 잡아낸 수에 포함 + 회장님 행 분리 표기
         rows = [
             # 본인 정정: 뮤즈 올림 + 뮤즈 정정 -> 올린 +1, 정정당한 0, 잡아낸 0
             _fact("f1", uploader="뮤즈", corrector="뮤즈", grade="확인됨"),
@@ -101,7 +102,7 @@ class TestAgentScorecardP3(unittest.TestCase):
             _fact("f3", uploader=" 뮤즈 ", corrector=" 큐 ", grade="확인됨"),
             # 비대상자('회장님')가 정정: 피클 올림 + 회장님 정정 -> 피클(올린+1, 정정당한+1), 잡아낸 변동 없음
             _fact("f4", uploader="피클", corrector="회장님", grade="확인됨"),
-            # 비대상자('회장님')가 올린 행을 에이전트(큐)가 정정 -> 큐 잡아낸 0 ('올린 이'가 대상 에이전트 아님)
+            # '회장님'이 올린 행을 에이전트(큐)가 정정 -> 큐 잡아낸 +1 (회장님 행 1)
             _fact("f5", uploader="회장님", corrector="큐", grade="확인됨"),
             # '올린 이' 미입력 행을 인스팅트가 정정 -> 인스팅트 잡아낸 0
             _fact("f6", uploader=None, corrector="인스팅트", grade="확인됨"),
@@ -122,16 +123,22 @@ class TestAgentScorecardP3(unittest.TestCase):
         self.assertEqual(by_agent["뮤즈"].uploaded_count, 3)
         self.assertEqual(by_agent["뮤즈"].corrected_against_count, 2)
         self.assertEqual(by_agent["뮤즈"].caught_count, 0)
+        self.assertEqual(by_agent["뮤즈"].caught_chairman_count, 0)
+        self.assertEqual(by_agent["뮤즈"].caught_label(), "0")
 
         # 피클: f4 -> 올린 1, 정정당한 1(f4), 잡아낸 1(f2)
         self.assertEqual(by_agent["피클"].uploaded_count, 1)
         self.assertEqual(by_agent["피클"].corrected_against_count, 1)
         self.assertEqual(by_agent["피클"].caught_count, 1)
+        self.assertEqual(by_agent["피클"].caught_chairman_count, 0)
+        self.assertEqual(by_agent["피클"].caught_label(), "1")
 
-        # 큐: 올린 0, 정정당한 0, 잡아낸 1(f3; f5는 회장님 올린 행이라 제외)
+        # 큐: 올린 0, 정정당한 0, 잡아낸 2(f3 + f5 회장님 행 1) -> "2 (회장님 행 1)"
         self.assertEqual(by_agent["큐"].uploaded_count, 0)
         self.assertEqual(by_agent["큐"].corrected_against_count, 0)
-        self.assertEqual(by_agent["큐"].caught_count, 1)
+        self.assertEqual(by_agent["큐"].caught_count, 2)
+        self.assertEqual(by_agent["큐"].caught_chairman_count, 1)
+        self.assertEqual(by_agent["큐"].caught_label(), "2 (회장님 행 1)")
 
         # 인스팅트: f8 -> 올린 1, 정정당한 0, 잡아낸 0(f6은 올린 이 미입력이라 제외)
         self.assertEqual(by_agent["인스팅트"].uploaded_count, 1)
@@ -178,7 +185,12 @@ class TestAgentScorecardP3(unittest.TestCase):
         self.assertTrue(is_fact_row_downgraded(row_manual_conflict))
         self.assertFalse(is_fact_row_auto_alert_downgraded(row_manual_conflict))
 
-        # 제외 대상: 자동확인불가(로그인 필요), 원문대조필요(확인 불가/열림 실패/발췌 그대로/None), 미확인, 대체됨
+        # P2.5 정의 변경: '대체됨' 관계만 있는 행도 내려간 행 O (자동 경보 X)
+        row_superseded_only = _fact("d4", uploader="뮤즈", grade="미확인", superseded_ids=("newer-1",))
+        self.assertTrue(is_fact_row_downgraded(row_superseded_only))
+        self.assertFalse(is_fact_row_auto_alert_downgraded(row_superseded_only))
+
+        # 제외 대상: 자동확인불가(로그인 필요), 원문대조필요(확인 불가/열림 실패/발췌 그대로/None), 미확인(대체됨 없음)
         excluded_rows = [
             _fact("x1", uploader="뮤즈", grade="자동확인불가", auto_revalidation_result="로그인 필요"),
             _fact("x2", uploader="뮤즈", grade="원문대조필요", auto_revalidation_result="확인 불가"),
@@ -186,13 +198,12 @@ class TestAgentScorecardP3(unittest.TestCase):
             _fact("x4", uploader="뮤즈", grade="원문대조필요", auto_revalidation_result="발췌 그대로"),
             _fact("x5", uploader="뮤즈", grade="원문대조필요", auto_revalidation_result=None),
             _fact("x6", uploader="뮤즈", grade="미확인", auto_revalidation_result=None),
-            _fact("x7", uploader="뮤즈", grade="미확인", superseded_ids=("newer-1",)),
         ]
         for r in excluded_rows:
             self.assertFalse(is_fact_row_downgraded(r), msg=r.page_id)
             self.assertFalse(is_fact_row_auto_alert_downgraded(r), msg=r.page_id)
 
-        # 전체 집계 검증 (뮤즈: 유지 3 + 내려간 3 + 제외 7 = 올린 13건)
+        # 전체 집계 검증 (뮤즈: 유지 3 + 내려간 4 + 제외 6 = 올린 13건)
         rows = [
             _fact("m1", uploader="뮤즈", grade="확인됨", auto_revalidation_result="발췌 그대로"),
             _fact("m2", uploader="뮤즈", grade="확인됨", auto_revalidation_result=None),
@@ -200,6 +211,7 @@ class TestAgentScorecardP3(unittest.TestCase):
             row_missing_excerpt,
             row_auto_conflict,
             row_manual_conflict,
+            row_superseded_only,
             *excluded_rows,
         ]
         sc = compute_agent_scorecard(rows)
@@ -207,29 +219,29 @@ class TestAgentScorecardP3(unittest.TestCase):
 
         self.assertEqual(muse.uploaded_count, 13)
         self.assertEqual(muse.maintained_count, 3)
-        self.assertEqual(muse.downgraded_count, 3)
-        self.assertEqual(muse.retention_denominator, 6)
-        self.assertEqual(muse.retention_label(), "50.0% (3/6)")
+        self.assertEqual(muse.downgraded_count, 4)
+        self.assertEqual(muse.retention_denominator, 7)
+        self.assertEqual(muse.retention_label(), "42.9% (3/7)")
         self.assertEqual(muse.auto_alert_count, 2)  # d1(발췌 사라짐) + d2(충돌 relation 불일치)
 
     # ------------------------------------------------------------------
-    # 3) 표본 부족 경계값 (올린 팩트 수 5 미만)
+    # 3) 표본 부족 경계값 (P2.5 정의 변경: 유지율 분모(유지 중 + 내려간 행) 5 미만)
     # ------------------------------------------------------------------
 
     def test_low_sample_boundary_under_five_uploads(self) -> None:
         rows = [
-            # 피클: 올린 4건 (유지 3, 내려간 1) -> 75.0% (3/4, 표본 부족)
+            # 피클: 올린 4건 (유지 3, 내려간 1, 분모 4 < 5) -> 75.0% (3/4, 표본 부족)
             _fact("p1", uploader="피클", grade="확인됨"),
             _fact("p2", uploader="피클", grade="확인됨"),
             _fact("p3", uploader="피클", grade="확인됨"),
             _fact("p4", uploader="피클", grade="불일치", conflict_ids=("other",)),
-            # 큐: 올린 5건 (유지 2, 내려간 1, 미확인 2) -> 올린 팩트 수 5이므로 표본 부족 미표기!
+            # 큐: 올린 5건이지만 유지 2 + 내려간 1 = 분모 3 < 5 -> P2.5 변경: 표본 부족 표기!
             _fact("q1", uploader="큐", grade="확인됨"),
             _fact("q2", uploader="큐", grade="확인됨"),
             _fact("q3", uploader="큐", grade="원문대조필요", auto_revalidation_result="발췌 사라짐"),
             _fact("q4", uploader="큐", grade="미확인"),
             _fact("q5", uploader="큐", grade="미확인"),
-            # 인스팅트: 올린 5건 (유지 4, 내려간 1) -> 80.0% (4/5)
+            # 인스팅트: 올린 5건 (유지 4, 내려간 1, 분모 5 >= 5) -> 80.0% (4/5)
             _fact("i1", uploader="인스팅트", grade="확인됨"),
             _fact("i2", uploader="인스팅트", grade="확인됨"),
             _fact("i3", uploader="인스팅트", grade="확인됨"),
@@ -246,9 +258,8 @@ class TestAgentScorecardP3(unittest.TestCase):
         self.assertTrue(by_agent["피클"].is_low_sample)
         self.assertEqual(by_agent["피클"].retention_label(), "75.0% (3/4, 표본 부족)")
 
-        self.assertFalse(by_agent["큐"].is_low_sample)
-        self.assertEqual(by_agent["큐"].retention_label(), "66.7% (2/3)")
-        self.assertNotIn("표본 부족", by_agent["큐"].retention_label())
+        self.assertTrue(by_agent["큐"].is_low_sample)
+        self.assertEqual(by_agent["큐"].retention_label(), "66.7% (2/3, 표본 부족)")
 
         self.assertFalse(by_agent["인스팅트"].is_low_sample)
         self.assertEqual(by_agent["인스팅트"].retention_label(), "80.0% (4/5)")
@@ -258,8 +269,7 @@ class TestAgentScorecardP3(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_uncomputable_display_for_zero_denominator_missing_fields_and_errors(self) -> None:
-        # (A) 올린 팩트 수 >= 5이지만 유지 중 + 내려간 행 == 0 -> '집계 불가' (표본 부족 미표기)
-        #     올린 팩트 수 < 5이고 분모 == 0 -> '집계 불가 (표본 부족)'
+        # (A) P2.5 변경: 올린 팩트 수 >= 5라도 유지율 분모(유지 중 + 내려간 행) == 0 (< 5)이면 '집계 불가 (표본 부족)'
         rows = [
             *[_fact(f"m{i}", uploader="뮤즈", grade="미확인") for i in range(6)],
             *[_fact(f"p{i}", uploader="피클", grade="원문대조필요", auto_revalidation_result="확인 불가") for i in range(3)],
@@ -267,11 +277,11 @@ class TestAgentScorecardP3(unittest.TestCase):
         sc_zero_denom = compute_agent_scorecard(rows)
         by_agent = {r.agent: r for r in sc_zero_denom.agent_rows}
         self.assertEqual(by_agent["뮤즈"].uploaded_count, 6)
-        self.assertEqual(by_agent["뮤즈"].retention_label(), "집계 불가")
+        self.assertEqual(by_agent["뮤즈"].retention_label(), "집계 불가 (표본 부족)")
         self.assertEqual(by_agent["피클"].uploaded_count, 3)
         self.assertEqual(by_agent["피클"].retention_label(), "집계 불가 (표본 부족)")
 
-        # (B) 스키마에서 '자동 재검증 결과'가 누락된 경우 -> 유지율·자동 경보 수 '집계 불가', 나머지는 정상 집계
+        # (B) 스키마에서 '자동 재검증 결과'가 누락된 경우 -> 유지율·자동 경보 수 '집계 불가'(분모 미산출이므로 표본 부족 미표기), 나머지는 정상 집계
         sample_rows = [
             _fact("s1", uploader="뮤즈", corrector="피클", grade="확인됨"),
             _fact("s2", uploader="뮤즈", grade="확인됨"),
@@ -281,7 +291,7 @@ class TestAgentScorecardP3(unittest.TestCase):
         ]
         sc_no_reval = compute_agent_scorecard(
             sample_rows,
-            available_properties={"주장", "등급", "올린 이", "정정한 이", "충돌"},
+            available_properties={"주장", "등급", "올린 이", "정정한 이", "충돌", "대체됨"},
         )
         self.assertEqual(sc_no_reval.missing_fields, ("자동 재검증 결과",))
         muse_nr = {r.agent: r for r in sc_no_reval.agent_rows}["뮤즈"]
@@ -291,12 +301,12 @@ class TestAgentScorecardP3(unittest.TestCase):
         self.assertEqual(muse_nr.count_label(muse_nr.corrected_against_count), "1")
         self.assertEqual(muse_nr.count_label(muse_nr.auto_alert_count), "집계 불가")
         self.assertEqual(pickle_nr.count_label(pickle_nr.caught_count), "1")
-        self.assertEqual(pickle_nr.retention_label(), "집계 불가 (표본 부족)")
+        self.assertEqual(pickle_nr.retention_label(), "집계 불가")
 
         # (C) 스키마에서 '충돌'만 누락된 경우 -> 유지율은 집계 가능, 자동 경보 수만 '집계 불가'
         sc_no_conflict = compute_agent_scorecard(
             sample_rows,
-            available_properties={"주장", "등급", "올린 이", "정정한 이", "자동 재검증 결과"},
+            available_properties={"주장", "등급", "올린 이", "정정한 이", "자동 재검증 결과", "대체됨"},
         )
         muse_nc = {r.agent: r for r in sc_no_conflict.agent_rows}["뮤즈"]
         self.assertEqual(muse_nc.retention_label(), "100.0% (5/5)")
@@ -579,6 +589,138 @@ class TestAgentScorecardP3(unittest.TestCase):
         cli = format_cli_summary(outcome.report)
         self.assertIn("에이전트 성적표(팩트 장부 7건)", cli)
         self.assertIn("뮤즈(5건/80.0% (4/5))", cli)
+
+    # ------------------------------------------------------------------
+    # 8) P2.5 작업 3 확정 판정 3건 전용 테스트
+    # ------------------------------------------------------------------
+
+    def test_p25_superseded_only_rows_count_as_downgraded_while_auto_unverifiable_stays_excluded(self) -> None:
+        rows = [
+            # 유지 중 2건
+            _fact("s-ok-1", uploader="뮤즈", grade="확인됨"),
+            _fact("s-ok-2", uploader="뮤즈", grade="확인됨"),
+            # '대체됨' 관계만 있는 행 3건 (미확인, 원문대조필요/확인불가, 확인됨) -> 모두 내려간 행, 자동 경보 0
+            _fact("s-sup-1", uploader="뮤즈", grade="미확인", superseded_ids=("s-ok-1",)),
+            _fact(
+                "s-sup-2",
+                uploader="뮤즈",
+                grade="원문대조필요",
+                auto_revalidation_result="확인 불가",
+                superseded_ids=("s-ok-1",),
+            ),
+            _fact("s-sup-3", uploader="뮤즈", grade="확인됨", superseded_ids=("s-ok-2",)),
+            # '자동확인불가(로그인 필요)'는 기존대로 제외 ('대체됨' 연결이 있더라도 제외)
+            _fact("s-login-1", uploader="뮤즈", grade="자동확인불가", auto_revalidation_result="로그인 필요"),
+            _fact(
+                "s-login-2",
+                uploader="뮤즈",
+                grade="자동확인불가",
+                auto_revalidation_result="로그인 필요",
+                superseded_ids=("s-ok-1",),
+            ),
+        ]
+
+        sc = compute_agent_scorecard(rows)
+        muse = {r.agent: r for r in sc.agent_rows}["뮤즈"]
+        self.assertEqual(muse.uploaded_count, 7)
+        self.assertEqual(muse.maintained_count, 2)
+        self.assertEqual(muse.downgraded_count, 3)
+        self.assertEqual(muse.retention_denominator, 5)
+        self.assertEqual(muse.retention_label(), "40.0% (2/5)")
+        self.assertEqual(muse.auto_alert_count, 0)
+
+        # '대체됨' 스키마 필드가 누락되면 유지율만 '집계 불가'
+        sc_no_sup = compute_agent_scorecard(
+            rows,
+            available_properties={"주장", "등급", "올린 이", "정정한 이", "자동 재검증 결과", "충돌"},
+        )
+        self.assertEqual(sc_no_sup.missing_fields, ("대체됨",))
+        muse_no_sup = {r.agent: r for r in sc_no_sup.agent_rows}["뮤즈"]
+        self.assertEqual(muse_no_sup.retention_label(), "집계 불가")
+        self.assertEqual(muse_no_sup.count_label(muse_no_sup.auto_alert_count), "0")
+
+    def test_p25_chairman_caught_rows_included_and_formatted_in_dashboard_table(self) -> None:
+        rows = [
+            # 피클이 타 에이전트 행 2건 + 회장님 행 1건 정정 -> "3 (회장님 행 1)"
+            _fact("c1", uploader="뮤즈", corrector="피클", grade="확인됨"),
+            _fact("c2", uploader="큐", corrector="피클", grade="확인됨"),
+            _fact("c3", uploader="회장님", corrector="피클", grade="확인됨"),
+            # 큐가 회장님 행만 1건 정정 -> "1 (회장님 행 1)"
+            _fact("c4", uploader="회장님", corrector="큐", grade="확인됨"),
+            # 인스팅트가 타 에이전트 행만 1건 정정 -> "1" (괄호 없음)
+            _fact("c5", uploader="피클", corrector="인스팅트", grade="확인됨"),
+            # 외부 비대상 업로더('외부인') 행을 클실장이 정정 -> 0 (포함 안 함)
+            _fact("c6", uploader="외부인", corrector="클실장", grade="확인됨"),
+        ]
+        sc = compute_agent_scorecard(rows)
+        by_agent = {r.agent: r for r in sc.agent_rows}
+
+        self.assertEqual(by_agent["피클"].caught_count, 3)
+        self.assertEqual(by_agent["피클"].caught_chairman_count, 1)
+        self.assertEqual(by_agent["피클"].caught_label(), "3 (회장님 행 1)")
+
+        self.assertEqual(by_agent["큐"].caught_count, 1)
+        self.assertEqual(by_agent["큐"].caught_chairman_count, 1)
+        self.assertEqual(by_agent["큐"].caught_label(), "1 (회장님 행 1)")
+
+        self.assertEqual(by_agent["인스팅트"].caught_count, 1)
+        self.assertEqual(by_agent["인스팅트"].caught_chairman_count, 0)
+        self.assertEqual(by_agent["인스팅트"].caught_label(), "1")
+
+        self.assertEqual(by_agent["클실장"].caught_count, 0)
+        self.assertEqual(by_agent["클실장"].caught_label(), "0")
+
+        # 대시보드 섹션 H 표 셀 렌더링 검증
+        report = DashboardReport(
+            updated_at_kst=self.now_kst,
+            run_status="정상",
+            failure_reasons=[],
+            warnings=[],
+            experience_sync=SourceSyncResult("experience", "체험단 DB", True, "full", 0, 0),
+            competition_sync=SourceSyncResult("competition", "경쟁 기록 DB", True, "full", 0, 0),
+            experience_analytics=None,
+            competition_analytics=None,
+            agent_scorecard=sc,
+        )
+        bottom = build_bottom_blocks(report)
+        h_idx = next(
+            i for i, b in enumerate(bottom) if extract_block_plain_text(b) == "H. 에이전트 성적표 (팩트 장부 기준)"
+        )
+        h_table = next(b for b in bottom[h_idx + 1 :] if b.get("type") == "table")
+        matrix = _extract_table_matrix(h_table)
+        # 컬럼 인덱스 4 == "잡아낸 수"
+        self.assertEqual(matrix[2][4], "3 (회장님 행 1)")  # 피클
+        self.assertEqual(matrix[3][4], "1 (회장님 행 1)")  # 큐
+        self.assertEqual(matrix[4][4], "1")  # 인스팅트
+        self.assertEqual(matrix[5][4], "0")  # 클실장
+
+    def test_p25_low_sample_uses_retention_denominator_not_uploaded_count(self) -> None:
+        rows = [
+            # 뮤즈: 올린 10건, 유지 2 + 내려간 2 = 분모 4 (< 5) -> 표본 부족 O
+            _fact("m1", uploader="뮤즈", grade="확인됨"),
+            _fact("m2", uploader="뮤즈", grade="확인됨"),
+            _fact("m3", uploader="뮤즈", grade="불일치"),
+            _fact("m4", uploader="뮤즈", grade="미확인", superseded_ids=("m1",)),
+            *[_fact(f"m-u-{i}", uploader="뮤즈", grade="미확인") for i in range(6)],
+            # 피클: 올린 5건, 유지 3 + 내려간 2 = 분모 5 (>= 5) -> 표본 부족 X
+            _fact("p1", uploader="피클", grade="확인됨"),
+            _fact("p2", uploader="피클", grade="확인됨"),
+            _fact("p3", uploader="피클", grade="확인됨"),
+            _fact("p4", uploader="피클", grade="원문대조필요", auto_revalidation_result="발췌 사라짐"),
+            _fact("p5", uploader="피클", grade="원문대조필요", superseded_ids=("p1",)),
+        ]
+        sc = compute_agent_scorecard(rows)
+        by_agent = {r.agent: r for r in sc.agent_rows}
+
+        self.assertEqual(by_agent["뮤즈"].uploaded_count, 10)
+        self.assertEqual(by_agent["뮤즈"].retention_denominator, 4)
+        self.assertTrue(by_agent["뮤즈"].is_low_sample)
+        self.assertEqual(by_agent["뮤즈"].retention_label(), "50.0% (2/4, 표본 부족)")
+
+        self.assertEqual(by_agent["피클"].uploaded_count, 5)
+        self.assertEqual(by_agent["피클"].retention_denominator, 5)
+        self.assertFalse(by_agent["피클"].is_low_sample)
+        self.assertEqual(by_agent["피클"].retention_label(), "60.0% (3/5)")
 
 
 if __name__ == "__main__":

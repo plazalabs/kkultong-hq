@@ -253,17 +253,23 @@ class AgentScoreRow:
 
     agent: str
     uploaded_count: Optional[int]  # 올린 팩트 수 ('올린 이' == agent)
-    maintained_count: Optional[int]  # 등급 '확인됨'으로 유지 중인 행 수
+    maintained_count: Optional[int]  # 등급 '확인됨'으로 유지 중인 행 수 ('대체됨' 미연결)
     downgraded_count: Optional[int]  # 장부 현재 필드로 집계 가능한 내려간 행 수
     corrected_against_count: Optional[int]  # 정정당한 수 ('올린 이' == agent, '정정한 이' 있고 != '올린 이')
-    caught_count: Optional[int]  # 잡아낸 수 ('정정한 이' == agent, '올린 이'가 다른 대상 에이전트)
+    caught_count: Optional[int]  # 잡아낸 수 ('정정한 이' == agent, '올린 이'가 타 에이전트 또는 '회장님')
     auto_alert_count: Optional[int]  # 자동 재검증으로 등급이 내려간 행 수
     min_sample_size: int = 5
+    caught_chairman_count: Optional[int] = 0  # 잡아낸 수 중 '올린 이' == '회장님'인 행 수 (대시보드 괄호 분리 표기용)
 
     @property
     def is_low_sample(self) -> bool:
-        """올린 팩트 수가 기준(기본 5) 미만이면 표본 부족."""
-        return self.uploaded_count is not None and self.uploaded_count < self.min_sample_size
+        """유지율 분모(유지 중 + 내려간 행)가 기준(기본 5) 미만이면 표본 부족.
+
+        P2.5 변경 근거: 올린 팩트 수가 5 이상이더라도 대부분이 '미확인' 등 미평가 상태이면
+        실제 유지율 계산 표본(분모)이 극소수일 수 있으므로, 유지율 분모를 표본 부족 기준으로 사용한다.
+        """
+        denom = self.retention_denominator
+        return denom is not None and denom < self.min_sample_size
 
     @property
     def retention_denominator(self) -> Optional[int]:
@@ -289,6 +295,14 @@ class AgentScoreRow:
         if self.is_low_sample:
             return f"{pct:.1f}% ({self.maintained_count}/{denom}, 표본 부족)"
         return f"{pct:.1f}% ({self.maintained_count}/{denom})"
+
+    def caught_label(self) -> str:
+        """잡아낸 수 칸 문자열 ('회장님' 행 정정이 있으면 괄호로 분리 표기: 예 '3 (회장님 행 1)')."""
+        if self.caught_count is None:
+            return "집계 불가"
+        if self.caught_chairman_count is not None and self.caught_chairman_count > 0:
+            return f"{self.caught_count} (회장님 행 {self.caught_chairman_count})"
+        return str(self.caught_count)
 
     @staticmethod
     def count_label(value: Optional[int]) -> str:

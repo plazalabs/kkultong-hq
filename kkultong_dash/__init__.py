@@ -94,4 +94,5 @@ SEED_TARGET_PLATFORMS = (
 
 # P3 에이전트 성적표 (대시보드 섹션 H — 📒 팩트 장부 기준)
 SCOREBOARD_AGENTS = ("뮤즈", "피클", "큐", "인스팅트", "클실장")
+SCOREBOARD_CHAIRMAN_ACTOR = "회장님"
 SCOREBOARD_MIN_SAMPLE_SIZE = 5

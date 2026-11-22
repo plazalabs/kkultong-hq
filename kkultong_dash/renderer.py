@@ -780,8 +780,9 @@ def _build_section_h(report: DashboardReport) -> list[dict[str, Any]]:
     caption_lines = [
         f"데이터 출처: 📒 팩트 장부 (전체 {sc.total_ledger_rows}건) | "
         f"대상 에이전트: {', '.join(r.agent for r in sc.agent_rows)}",
-        "유지율 = 등급 '확인됨' 행 ÷ (유지 중 + 내려간 행) | 표본 부족: 올린 팩트 수 5 미만",
-        "내려간 행 기준(현재 필드): 등급 '불일치' 또는 (등급 '원문대조필요' 및 자동 재검증 결과 '발췌 사라짐')",
+        "유지율 = 등급 '확인됨' 행 ÷ (유지 중 + 내려간 행) | 표본 부족: 유지율 분모(유지 중 + 내려간 행) 5 미만",
+        "내려간 행 기준(현재 필드): 등급 '불일치', (등급 '원문대조필요' 및 자동 재검증 결과 '발췌 사라짐'), 또는 '대체됨' 연결 있음 ('자동확인불가' 제외)",
+        "잡아낸 수: 타 에이전트 또는 '회장님'이 올린 행을 정정한 수 ('회장님' 행은 괄호로 분리 표기)",
         "자동 경보 수 기준(현재 필드): (등급 '불일치' 및 충돌 연결 있음) 또는 (등급 '원문대조필요' 및 자동 재검증 결과 '발췌 사라짐')",
     ]
     if sc.missing_fields:
@@ -801,7 +802,7 @@ def _build_section_h(report: DashboardReport) -> list[dict[str, Any]]:
                 make_rich_text(row.count_label(row.uploaded_count)),
                 make_rich_text(row.retention_label()),
                 make_rich_text(row.count_label(row.corrected_against_count)),
-                make_rich_text(row.count_label(row.caught_count)),
+                make_rich_text(row.caught_label()),
                 make_rich_text(row.count_label(row.auto_alert_count)),
             ]
         )
